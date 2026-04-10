@@ -4,6 +4,8 @@
 
 **不做 OCR**，仅做版面检测 + PDF 原生文本提取。
 
+![screenshot](screenshot.png)
+
 ## 功能
 
 - **版面检测**：使用 HuggingFace 上的 PP-DocLayoutV3 模型，识别标题、表格、文本、公式等区域
