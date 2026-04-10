@@ -2,6 +2,7 @@
 使用 HuggingFace transformers + PyTorch 加载 PP-DocLayoutV3 模型
 对 PDF 中的表格区域，使用 PyMuPDF 提取单元格结构"""
 
+import re
 import time
 import uuid
 import shutil
@@ -177,9 +178,13 @@ def extract_table_cells(pdf_path: str, page_num: int, table_bbox: list,
 
     # 图片是 2x 渲染的，PDF 坐标 = 图片坐标 / 2
     scale = 2.0
+    pad = 10  # PDF 坐标下扩大 10pt，防止 bbox 偏小丢列
+    page_rect = page.rect
     pdf_rect = fitz.Rect(
-        table_bbox[0] / scale, table_bbox[1] / scale,
-        table_bbox[2] / scale, table_bbox[3] / scale,
+        max(0, table_bbox[0] / scale - pad),
+        max(0, table_bbox[1] / scale - pad),
+        min(page_rect.width, table_bbox[2] / scale + pad),
+        min(page_rect.height, table_bbox[3] / scale + pad),
     )
 
     tables = page.find_tables(clip=pdf_rect)
@@ -233,9 +238,16 @@ def _clean_text(text: str) -> str:
 
 
 def _split_value(text: str):
-    """单值保持字符串，多行拆成数组"""
+    """单值保持字符串，多行拆成数组。纯标点行合并回上一行。"""
     text = _clean_text(text)
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    raw = [l.strip() for l in text.split("\n") if l.strip()]
+    # 纯标点/符号的行合并回上一行
+    lines = []
+    for l in raw:
+        if re.fullmatch(r'[\W_]+', l) and lines:
+            lines[-1] += l
+        else:
+            lines.append(l)
     return lines if len(lines) > 1 else (lines[0] if lines else "")
 
 
