@@ -38,7 +38,16 @@ python server.py
 
 访问 http://localhost:3001
 
-首次检测时会自动从 HuggingFace 下载 PP-DocLayoutV3 模型（约 200MB），后续使用缓存。
+启动时会自动从 HuggingFace 下载 PP-DocLayoutV3 模型（约 200MB），页面顶部会显示加载状态。下载完成后显示「模型就绪」即可使用。
+
+### 国内用户加速下载
+
+如果 HuggingFace 访问缓慢，可以使用镜像源：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+python server.py
+```
 
 ## 结构化输出示例
 

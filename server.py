@@ -6,6 +6,7 @@ import time
 import uuid
 import shutil
 import logging
+import threading
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -23,25 +24,47 @@ app = FastAPI(title="PP-StructureV3 Demo")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# ── 版面检测模型（懒加载）──────────────────────────────────────────
+# ── 版面检测模型 ──────────────────────────────────────────────────
 _MODEL_NAME = "PaddlePaddle/PP-DocLayoutV3_safetensors"
 _THRESHOLD = 0.35
 _processor = None
 _model = None
+_model_status = "loading"  # loading | ready | error
+_model_error = ""
+
+
+def _load_model():
+    global _processor, _model, _model_status, _model_error
+    try:
+        t0 = time.time()
+        log.info(f"正在下载/加载 {_MODEL_NAME} ...")
+        _processor = RTDetrImageProcessor.from_pretrained(_MODEL_NAME)
+        _model = AutoModelForObjectDetection.from_pretrained(_MODEL_NAME)
+        if torch.cuda.is_available():
+            _model.to("cuda")
+        _model.eval()
+        _model_status = "ready"
+        log.info(f"模型加载完成: {time.time() - t0:.2f}s")
+    except Exception as e:
+        _model_status = "error"
+        _model_error = str(e)
+        log.error(f"模型加载失败: {e}")
 
 
 def _ensure_model():
-    global _processor, _model
-    if _model is not None:
-        return
-    t0 = time.time()
-    log.info(f"正在加载 {_MODEL_NAME} ...")
-    _processor = RTDetrImageProcessor.from_pretrained(_MODEL_NAME)
-    _model = AutoModelForObjectDetection.from_pretrained(_MODEL_NAME)
-    if torch.cuda.is_available():
-        _model.to("cuda")
-    _model.eval()
-    log.info(f"模型加载完成: {time.time() - t0:.2f}s")
+    if _model is None:
+        raise RuntimeError("模型尚未加载完成，请稍候")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """启动时在后台线程预加载模型"""
+    threading.Thread(target=_load_model, daemon=True).start()
+
+
+@app.get("/api/model-status")
+async def model_status():
+    return {"status": _model_status, "error": _model_error}
 
 
 # ── PDF → 图片 + 保留原始 PDF ──────────────────────────────────────

@@ -101,6 +101,7 @@ header .tag { background: #e94560; padding: 2px 10px; border-radius: 12px; font-
 <header>
   <h1>PP-StructureV3 版面结构化演示</h1>
   <span class="tag">版面检测 + PDF 表格结构提取</span>
+  <span id="modelStatus" class="tag" style="background:#ff9800">模型加载中...</span>
   <div style="flex:1"></div>
   <label class="btn" style="background:#e94560;color:#fff;cursor:pointer">
     上传文件
@@ -190,6 +191,30 @@ function renderJson() {
   view.innerHTML = `<pre>${escHtml(JSON.stringify(structured, null, 2))}</pre>`;
 }
 
+// ── 模型状态轮询 ────────────────────────────────────────────────
+let modelReady = false;
+(async function pollModelStatus() {
+  const el = document.getElementById('modelStatus');
+  while (!modelReady) {
+    try {
+      const res = await fetch('/api/model-status');
+      const data = await res.json();
+      if (data.status === 'ready') {
+        modelReady = true;
+        el.textContent = '模型就绪';
+        el.style.background = '#34a853';
+        document.getElementById('detectBtn').disabled = !state.activePage;
+        return;
+      } else if (data.status === 'error') {
+        el.textContent = '模型加载失败';
+        el.style.background = '#ea4335';
+        return;
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1000));
+  }
+})();
+
 // ── 上传 ──────────────────────────────────────────────────────────
 const fileInput = document.getElementById('fileInput');
 const uploadBox = document.getElementById('uploadBox');
@@ -239,7 +264,7 @@ function selectPage(num) {
     <img id="pageImg" src="/api/images/${state.docId}/${filename}" onload="onImageLoaded()">
   </div>`;
 
-  document.getElementById('detectBtn').disabled = false;
+  document.getElementById('detectBtn').disabled = !modelReady;
   renderSidebar();
   renderResults();
   if (state.resultView === 'json') renderJson();
