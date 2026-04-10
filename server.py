@@ -1,6 +1,7 @@
-"""PP-StructureV3 版面结构化演示 — 仅做版面检测，不做 OCR
-使用 HuggingFace transformers + PyTorch 加载 PP-DocLayoutV3 模型
-对 PDF 中的表格区域，使用 PyMuPDF 提取单元格结构"""
+"""PP-StructureV3 版面结构化演示
+- 版面检测：PP-DocLayoutV3 (HuggingFace transformers + PyTorch)
+- 文本提取：PyMuPDF（文本型 PDF）/ PP-OCRv5 ONNX（扫描件）
+- 表格提取：PyMuPDF"""
 
 import re
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 import torch
+import numpy as np
 from PIL import Image
 from transformers import RTDetrImageProcessor, AutoModelForObjectDetection
 from fastapi import FastAPI, UploadFile, File
@@ -42,33 +44,30 @@ def _load_model():
         local = _MODEL_DIR / "config.json"
 
         if local.exists():
-            # 本地已有，直接加载（离线）
             src = str(_MODEL_DIR)
-            log.info(f"从本地加载模型: {src}")
+            log.info(f"从本地加载版面模型: {src}")
         else:
-            # 首次启动，从 HuggingFace 下载并保存到项目目录
             src = _MODEL_NAME
             log.info(f"首次启动，从 HuggingFace 下载 {src} ...")
 
         _processor = RTDetrImageProcessor.from_pretrained(src)
         _model = AutoModelForObjectDetection.from_pretrained(src)
 
-        # 如果是远程下载的，保存到本地
         if not local.exists():
             _MODEL_DIR.mkdir(parents=True, exist_ok=True)
             _processor.save_pretrained(str(_MODEL_DIR))
             _model.save_pretrained(str(_MODEL_DIR))
-            log.info(f"模型已保存到 {_MODEL_DIR}/")
+            log.info(f"版面模型已保存到 {_MODEL_DIR}/")
 
         if torch.cuda.is_available():
             _model.to("cuda")
         _model.eval()
         _model_status = "ready"
-        log.info(f"模型加载完成: {time.time() - t0:.2f}s")
+        log.info(f"版面模型加载完成: {time.time() - t0:.2f}s")
     except Exception as e:
         _model_status = "error"
         _model_error = str(e)
-        log.error(f"模型加载失败: {e}")
+        log.error(f"版面模型加载失败: {e}")
 
 
 def _ensure_model():
@@ -76,20 +75,98 @@ def _ensure_model():
         raise RuntimeError("模型尚未加载完成，请稍候")
 
 
+# ── OCR 模型（PP-OCRv5 ONNX）─────────────────────────────────────
+_OCR_DIR = Path("model/ocr")
+_ocr_engine = None
+
+
+def _get_ocr():
+    global _ocr_engine
+    if _ocr_engine is not None:
+        return _ocr_engine
+
+    det = str(_OCR_DIR / "ppocr5_server_det.onnx")
+    cls = str(_OCR_DIR / "ppocr5_cls.onnx")
+    rec = str(_OCR_DIR / "ppocr5_server_rec.onnx")
+    dic = str(_OCR_DIR / "ppocr5_dict.txt")
+
+    if not Path(det).exists():
+        log.warning("OCR 模型未找到，扫描件将无法识别文字")
+        return None
+
+    from ppocr5 import simple_ppocr5
+    use_gpu = torch.cuda.is_available()
+    _ocr_engine = simple_ppocr5(
+        ppocr5_onnx_det=det, ppocr5_onnx_cls=cls,
+        ppocr5_onnx_rec=rec, ppcor5_dict=dic, use_gpu=use_gpu,
+    )
+    log.info(f"OCR 模型加载完成 (GPU={use_gpu})")
+    return _ocr_engine
+
+
+def ocr_image(image_path: str) -> str:
+    """对图片进行 OCR，返回全文"""
+    engine = _get_ocr()
+    if engine is None:
+        return ""
+    engine.run(image_path)
+    if not engine.results:
+        return ""
+    # 按 y 坐标排序，拼接文本
+    items = sorted(engine.results, key=lambda r: (r["rec_pos"][0][1], r["rec_pos"][0][0]))
+    return "\n".join(r["text"] for r in items)
+
+
+def ocr_region(image_path: str, bbox: list) -> str:
+    """对图片中指定区域进行 OCR"""
+    import cv2
+    img = cv2.imread(image_path)
+    if img is None:
+        return ""
+    x1, y1, x2, y2 = bbox
+    crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
+        return ""
+    engine = _get_ocr()
+    if engine is None:
+        return ""
+    engine.run(crop)
+    if not engine.results:
+        return ""
+    items = sorted(engine.results, key=lambda r: (r["rec_pos"][0][1], r["rec_pos"][0][0]))
+    return "\n".join(r["text"] for r in items)
+
+
+# ── 判断页面是否有文字层 ─────────────────────────────────────────
+def page_has_text(pdf_path: str, page_num: int) -> bool:
+    """判断 PDF 某页是否有可用的文字层（非乱码）"""
+    doc = fitz.open(pdf_path)
+    page = doc[page_num - 1]
+    text = page.get_text("text").strip()
+    doc.close()
+
+    if not text or len(text) < 5:
+        return False
+
+    # 检查乱码：如果大量不可识别字符，视为无效
+    printable = sum(1 for c in text if c.isprintable() or c in '\n\r\t')
+    ratio = printable / len(text) if text else 0
+    return ratio > 0.5
+
+
 @app.on_event("startup")
 async def startup_event():
-    """启动时在后台线程预加载模型"""
     threading.Thread(target=_load_model, daemon=True).start()
 
 
 @app.get("/api/model-status")
 async def model_status():
-    return {"status": _model_status, "error": _model_error}
+    ocr_available = (_OCR_DIR / "ppocr5_server_det.onnx").exists()
+    return {"status": _model_status, "error": _model_error, "ocr_available": ocr_available}
 
 
 # ── PDF → 图片 + 保留原始 PDF ──────────────────────────────────────
 def pdf_to_images(pdf_bytes: bytes, doc_dir: Path) -> list[str]:
-    # 保存原始 PDF 供后续表格提取
     (doc_dir / "source.pdf").write_bytes(pdf_bytes)
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -133,10 +210,8 @@ def detect_layout(image_path: str) -> list[dict]:
             "order": i,
         })
 
-    # 过滤掉页码
     blocks = [b for b in blocks if b["label"] != "number"]
 
-    # 按置信度降序排列，NMS 去除重叠框（IoU > 0.5 保留高分的）
     blocks.sort(key=lambda b: -b["score"])
     kept = []
     for b in blocks:
@@ -154,7 +229,6 @@ def detect_layout(image_path: str) -> list[dict]:
 
 
 def _iou(a, b):
-    """计算两个 bbox 的 IoU"""
     x1 = max(a[0], b[0])
     y1 = max(a[1], b[1])
     x2 = min(a[2], b[2])
@@ -170,15 +244,11 @@ def _iou(a, b):
 # ── 表格单元格提取（PyMuPDF）──────────────────────────────────────
 def extract_table_cells(pdf_path: str, page_num: int, table_bbox: list,
                         img_width: int, img_height: int) -> list[dict]:
-    """从 PDF 中提取指定区域内的表格单元格。
-    table_bbox 是图片坐标系下的 [x1,y1,x2,y2]，需要转换回 PDF 坐标。
-    """
     doc = fitz.open(pdf_path)
     page = doc[page_num - 1]
 
-    # 图片是 2x 渲染的，PDF 坐标 = 图片坐标 / 2
     scale = 2.0
-    pad = 10  # PDF 坐标下扩大 10pt，防止 bbox 偏小丢列
+    pad = 10
     page_rect = page.rect
     pdf_rect = fitz.Rect(
         max(0, table_bbox[0] / scale - pad),
@@ -194,7 +264,7 @@ def extract_table_cells(pdf_path: str, page_num: int, table_bbox: list,
         for row_idx, row in enumerate(table.rows):
             for col_idx, cell_rect in enumerate(row.cells):
                 if cell_rect is None:
-                    continue  # 合并单元格的非主格，跳过
+                    continue
                 text = ""
                 if row_idx < len(rows_text) and col_idx < len(rows_text[row_idx]):
                     text = rows_text[row_idx][col_idx] or ""
@@ -215,33 +285,33 @@ def extract_table_cells(pdf_path: str, page_num: int, table_bbox: list,
     return cells
 
 
-# ── 提取标题文本（PyMuPDF）────────────────────────────────────────
-def extract_title_text(pdf_path: str, page_num: int, bbox: list) -> str:
-    """从 PDF 对应区域提取文字"""
-    doc = fitz.open(pdf_path)
-    page = doc[page_num - 1]
-    scale = 2.0
-    rect = fitz.Rect(bbox[0] / scale, bbox[1] / scale,
-                     bbox[2] / scale, bbox[3] / scale)
-    text = page.get_text("text", clip=rect).strip()
-    doc.close()
-    return text
+# ── 文本提取（自动选择 PyMuPDF 或 OCR）───────────────────────────
+def extract_text_from_region(pdf_path: str | None, page_num: int,
+                             bbox: list, image_path: str,
+                             has_text_layer: bool) -> str:
+    """从指定区域提取文字。有文字层用 PyMuPDF，否则用 OCR。"""
+    if has_text_layer and pdf_path:
+        doc = fitz.open(pdf_path)
+        page = doc[page_num - 1]
+        scale = 2.0
+        rect = fitz.Rect(bbox[0] / scale, bbox[1] / scale,
+                         bbox[2] / scale, bbox[3] / scale)
+        text = page.get_text("text", clip=rect).strip()
+        doc.close()
+        return text
+    else:
+        return ocr_region(image_path, bbox)
 
 
 # ── 结构化输出 ────────────────────────────────────────────────────
 def _clean_text(text: str) -> str:
-    """清理文本中多余的空格（如"单 元"→"单元"）"""
-    import re
-    # 中文字符间的空格去掉
     text = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', text)
     return text.strip()
 
 
 def _split_value(text: str):
-    """单值保持字符串，多行拆成数组。纯标点行合并回上一行。"""
     text = _clean_text(text)
     raw = [l.strip() for l in text.split("\n") if l.strip()]
-    # 纯标点/符号的行合并回上一行
     lines = []
     for l in raw:
         if re.fullmatch(r'[\W_]+', l) and lines:
@@ -251,8 +321,8 @@ def _split_value(text: str):
     return lines if len(lines) > 1 else (lines[0] if lines else "")
 
 
-def build_structured(blocks: list, pdf_path: str | None, page_num: int) -> dict:
-    """将检测结果转为干净的结构化数据"""
+def build_structured(blocks: list, pdf_path: str | None, page_num: int,
+                     image_path: str, has_text_layer: bool) -> dict:
     content = []
 
     for block in blocks:
@@ -260,14 +330,12 @@ def build_structured(blocks: list, pdf_path: str | None, page_num: int) -> dict:
 
         # 标题类
         if label in ("paragraph_title", "document_title", "title"):
-            text = ""
-            if pdf_path:
-                text = extract_title_text(pdf_path, page_num, block["bbox"])
+            text = extract_text_from_region(
+                pdf_path, page_num, block["bbox"], image_path, has_text_layer
+            )
             if text:
-                # 按行拆分，每行一个独立标题
                 lines = [_clean_text(l) for l in text.split("\n") if l.strip()]
                 for line in lines:
-                    # 去重
                     if not any(c["type"] == "title" and c["text"] == line for c in content):
                         content.append({"type": "title", "text": line})
 
@@ -277,15 +345,12 @@ def build_structured(blocks: list, pdf_path: str | None, page_num: int) -> dict:
             max_row = max(c["row"] for c in cells)
             max_col = max(c["col"] for c in cells)
 
-            # 构建二维网格
             grid = [[None] * (max_col + 1) for _ in range(max_row + 1)]
             for c in cells:
                 grid[c["row"]][c["col"]] = c["text"] or ""
 
-            # 第一行做表头
             headers = [_clean_text(grid[0][c] or f"列{c+1}") for c in range(max_col + 1)]
 
-            # 后续行：向上继承合并单元格的值
             rows = []
             prev = [""] * (max_col + 1)
             for r in range(1, max_row + 1):
@@ -293,7 +358,7 @@ def build_structured(blocks: list, pdf_path: str | None, page_num: int) -> dict:
                 for c in range(max_col + 1):
                     val = grid[r][c]
                     if val is None or val == "":
-                        val = prev[c]  # 继承上方合并单元格
+                        val = prev[c]
                     else:
                         prev[c] = val
                     row_data[headers[c]] = _split_value(val)
@@ -301,13 +366,24 @@ def build_structured(blocks: list, pdf_path: str | None, page_num: int) -> dict:
 
             content.append({"type": "table", "headers": headers, "rows": rows})
 
-        # 其他文本类
-        elif label == "text":
-            text = ""
-            if pdf_path:
-                text = extract_title_text(pdf_path, page_num, block["bbox"])
+        # 表格（扫描件，无单元格但可 OCR 整块）
+        elif label == "table" and block.get("cells") is None:
+            text = extract_text_from_region(
+                pdf_path, page_num, block["bbox"], image_path, has_text_layer
+            )
             if text:
-                content.append({"type": "text", "text": text})
+                content.append({"type": "table_text", "text": _clean_text(text),
+                                "note": "扫描件表格，仅提取文字，无法解析单元格结构"})
+
+        # 文本类（text, content, abstract, header 等）
+        elif label in ("text", "content", "abstract", "reference",
+                        "header", "footer", "algorithm",
+                        "figure_title", "table_title"):
+            text = extract_text_from_region(
+                pdf_path, page_num, block["bbox"], image_path, has_text_layer
+            )
+            if text:
+                content.append({"type": "text", "text": _clean_text(text)})
 
     return {"page": page_num, "content": content}
 
@@ -363,26 +439,37 @@ async def detect(doc_id: str, page_num: int):
     with Image.open(img_path) as img:
         w, h = img.size
 
-    # 如果有原始 PDF，对 table 区域提取单元格
     pdf_path = doc_dir / "source.pdf"
     is_pdf = pdf_path.exists()
 
+    # 逐页判断是否有文字层
+    has_text_layer = False
+    if is_pdf:
+        has_text_layer = page_has_text(str(pdf_path), page_num)
+
+    text_source = "pdf" if has_text_layer else "ocr"
+    log.info(f"第 {page_num} 页文字来源: {text_source}")
+
     for block in blocks:
         if block["label"] == "table":
-            if is_pdf:
+            if has_text_layer:
                 block["cells"] = extract_table_cells(
                     str(pdf_path), page_num, block["bbox"], w, h
                 )
             else:
-                block["cells"] = None  # 图片模式，无法提取单元格
+                block["cells"] = None
 
-    # 构建结构化数据
     structured = build_structured(
-        blocks, str(pdf_path) if is_pdf else None, page_num
+        blocks, str(pdf_path) if is_pdf else None, page_num,
+        str(img_path), has_text_layer
     )
 
-    return {"page": page_num, "width": w, "height": h, "blocks": blocks,
-            "is_pdf": is_pdf, "structured": structured}
+    return {
+        "page": page_num, "width": w, "height": h,
+        "blocks": blocks, "is_pdf": is_pdf,
+        "text_source": text_source,
+        "structured": structured,
+    }
 
 
 @app.post("/api/detect-all/{doc_id}")
@@ -401,18 +488,29 @@ async def detect_all(doc_id: str):
         with Image.open(img_path) as img:
             w, h = img.size
 
+        has_text_layer = False
+        if is_pdf:
+            has_text_layer = page_has_text(str(pdf_path), page_num)
+
         for block in blocks:
             if block["label"] == "table":
-                if is_pdf:
+                if has_text_layer:
                     block["cells"] = extract_table_cells(
                         str(pdf_path), page_num, block["bbox"], w, h
                     )
                 else:
                     block["cells"] = None
 
-        pages_result.append(
-            {"page": page_num, "width": w, "height": h, "blocks": blocks}
+        structured = build_structured(
+            blocks, str(pdf_path) if is_pdf else None, page_num,
+            str(img_path), has_text_layer
         )
+
+        pages_result.append({
+            "page": page_num, "width": w, "height": h,
+            "blocks": blocks, "text_source": "pdf" if has_text_layer else "ocr",
+            "structured": structured,
+        })
 
     return {"doc_id": doc_id, "pages": pages_result, "is_pdf": is_pdf}
 
