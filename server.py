@@ -26,6 +26,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 # ── 版面检测模型 ──────────────────────────────────────────────────
 _MODEL_NAME = "PaddlePaddle/PP-DocLayoutV3_safetensors"
+_MODEL_DIR = Path("model")
 _THRESHOLD = 0.35
 _processor = None
 _model = None
@@ -37,9 +38,27 @@ def _load_model():
     global _processor, _model, _model_status, _model_error
     try:
         t0 = time.time()
-        log.info(f"正在下载/加载 {_MODEL_NAME} ...")
-        _processor = RTDetrImageProcessor.from_pretrained(_MODEL_NAME)
-        _model = AutoModelForObjectDetection.from_pretrained(_MODEL_NAME)
+        local = _MODEL_DIR / "config.json"
+
+        if local.exists():
+            # 本地已有，直接加载（离线）
+            src = str(_MODEL_DIR)
+            log.info(f"从本地加载模型: {src}")
+        else:
+            # 首次启动，从 HuggingFace 下载并保存到项目目录
+            src = _MODEL_NAME
+            log.info(f"首次启动，从 HuggingFace 下载 {src} ...")
+
+        _processor = RTDetrImageProcessor.from_pretrained(src)
+        _model = AutoModelForObjectDetection.from_pretrained(src)
+
+        # 如果是远程下载的，保存到本地
+        if not local.exists():
+            _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            _processor.save_pretrained(str(_MODEL_DIR))
+            _model.save_pretrained(str(_MODEL_DIR))
+            log.info(f"模型已保存到 {_MODEL_DIR}/")
+
         if torch.cuda.is_available():
             _model.to("cuda")
         _model.eval()
