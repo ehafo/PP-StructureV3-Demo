@@ -28,7 +28,7 @@ header .tag { background: #e94560; padding: 2px 10px; border-radius: 12px; font-
 .bbox-overlay.highlight { opacity: 1; box-shadow: 0 0 12px rgba(0,0,0,0.4); z-index: 10; }
 .bbox-label { position: absolute; top: -18px; left: 0; font-size: 11px; padding: 1px 6px; color: #fff; border-radius: 3px; white-space: nowrap; pointer-events: none; }
 /* 单元格边框 */
-.cell-overlay { position: absolute; border: 1px solid rgba(234,67,53,0.4); background: rgba(234,67,53,0.03); cursor: pointer; pointer-events: auto; transition: all 0.15s; }
+.cell-overlay { position: absolute; border: 1px solid rgba(234,67,53,0.2); background: rgba(234,67,53,0.01); cursor: pointer; pointer-events: auto; transition: all 0.15s; }
 .cell-overlay.highlight { border: 2px solid #ea4335; background: rgba(234,67,53,0.25); z-index: 11; }
 
 /* 右侧 - 检测结果（可拖动宽度）*/
@@ -68,6 +68,17 @@ header .tag { background: #e94560; padding: 2px 10px; border-radius: 12px; font-
 .tree-leaf.highlight { background: #fce4ec; outline: 2px solid #ea4335; }
 .tree-leaf .tree-tag { font-size: 10px; padding: 0 5px; border-radius: 8px; background: #e8f5e9; color: #2e7d32; white-space: nowrap; }
 .image-hint { margin-top: 6px; font-size: 11px; color: #e67e22; font-style: italic; }
+/* 目录覆盖层 */
+.toc-overlay { position: absolute; border: 1px solid rgba(26,115,232,0.15); background: transparent; cursor: pointer; pointer-events: auto; transition: all 0.15s; }
+.toc-overlay.highlight { border: 1px solid #0d47a1; background: rgba(26,115,232,0.15); z-index: 11; }
+/* 目录展示 */
+.toc-list { margin-top: 6px; font-size: 12px; }
+.toc-item { display: flex; align-items: baseline; gap: 6px; padding: 3px 6px; border-radius: 4px; cursor: pointer; transition: background 0.15s; }
+.toc-item:hover { background: #f0f0f0; }
+.toc-item.highlight { background: #e3f2fd; outline: 2px solid #1a73e8; }
+.toc-item .toc-title { flex: 1; }
+.toc-item .toc-page { font-size: 11px; color: #999; white-space: nowrap; min-width: 30px; text-align: right; }
+.toc-item .toc-page span { background: #e8eaf6; color: #3f51b5; padding: 0 6px; border-radius: 8px; font-size: 10px; }
 
 /* 上传区 */
 .upload-zone { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%; }
@@ -76,6 +87,10 @@ header .tag { background: #e94560; padding: 2px 10px; border-radius: 12px; font-
 .upload-box input { display: none; }
 .upload-box .icon { font-size: 48px; margin-bottom: 12px; }
 .upload-box p { color: #888; font-size: 14px; }
+/* 文字来源标签 */
+.source-tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 500; display: inline-block; }
+.source-tag.pdf { background: #e8f5e9; color: #2e7d32; }
+.source-tag.ocr { background: #fff3e0; color: #e65100; }
 
 /* 按钮 */
 .btn { padding: 6px 16px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; transition: background 0.2s; }
@@ -125,7 +140,7 @@ header .tag { background: #e94560; padding: 2px 10px; border-radius: 12px; font-
   <div class="result-panel" id="resultPanel">
     <div class="resize-handle" id="resizeHandle"></div>
     <div class="result-header">
-      <span>检测结果</span>
+      <span>检测结果</span><span id="sourceTag"></span>
       <div style="display:flex; align-items:center; gap:8px;">
         <div class="view-switch">
           <span class="active" onclick="switchResultView('visual')">可视化</span>
@@ -201,7 +216,8 @@ let modelReady = false;
       const data = await res.json();
       if (data.status === 'ready') {
         modelReady = true;
-        el.textContent = '模型就绪';
+        const ocrLabel = data.ocr_model ? ` | OCR: ${data.ocr_model}` : '';
+        el.textContent = '模型就绪' + ocrLabel;
         el.style.background = '#34a853';
         document.getElementById('detectBtn').disabled = !state.activePage;
         return;
@@ -229,6 +245,7 @@ fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(
 async function handleFile(file) {
   const form = new FormData();
   form.append('file', file);
+  document.getElementById('sourceTag').innerHTML = '';
   document.getElementById('resultList').innerHTML = '<div class="loading">上传中...</div>';
 
   const res = await fetch('/api/upload', { method: 'POST', body: form });
@@ -264,6 +281,7 @@ function selectPage(num) {
     <img id="pageImg" src="/api/images/${state.docId}/${filename}" onload="onImageLoaded()">
   </div>`;
 
+  document.getElementById('sourceTag').innerHTML = '';
   document.getElementById('detectBtn').disabled = !modelReady;
   renderSidebar();
   renderResults();
@@ -288,6 +306,17 @@ async function detectCurrent() {
   document.getElementById('resultList').innerHTML = '<div class="loading">正在做版面检测...</div>';
 
   try {
+    // 先快速获取文字来源并显示
+    const srcRes = await fetch(`/api/text-source/${state.docId}/${state.activePage}`);
+    const srcData = await srcRes.json();
+    const srcTag = document.getElementById('sourceTag');
+    if (srcData.text_source === 'ocr') {
+      srcTag.innerHTML = '<span class="source-tag ocr">OCR 识别</span>';
+      document.getElementById('resultList').innerHTML = '<div class="loading">正在做版面检测 + OCR 识别（较慢）...</div>';
+    } else {
+      srcTag.innerHTML = '<span class="source-tag pdf">PDF 文字层</span>';
+    }
+
     const res = await fetch(`/api/detect/${state.docId}/${state.activePage}`, { method: 'POST' });
     const data = await res.json();
     state.detectedPages[state.activePage] = data;
@@ -351,13 +380,39 @@ function highlightCell(blockIdx, row, col) {
   }
 }
 
+function highlightTocItem(blockIdx, tocIdx) {
+  clearHighlights();
+  // 高亮图片上的 toc 覆盖层
+  const overlay = document.querySelector(`.toc-overlay[data-block="${blockIdx}"][data-toc="${tocIdx}"]`);
+  if (overlay) {
+    overlay.classList.add('highlight');
+    const preview = document.getElementById('preview');
+    const rect = overlay.getBoundingClientRect();
+    const previewRect = preview.getBoundingClientRect();
+    if (rect.top < previewRect.top || rect.bottom > previewRect.bottom) {
+      overlay.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+  // 高亮右侧 toc 列表项
+  const item = document.querySelector(`.toc-item[data-block="${blockIdx}"][data-toc="${tocIdx}"]`);
+  if (item) {
+    item.classList.add('highlight');
+    item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // 确保展开
+    const wrapper = item.closest('[id^="toc-"]');
+    if (wrapper && wrapper.style.display === 'none') {
+      toggleCells(wrapper.id);
+    }
+  }
+}
+
 // ── 绘制 bbox + 单元格 ───────────────────────────────────────────
 function drawBoxes(data) {
   const container = document.getElementById('imgContainer');
   const img = document.getElementById('pageImg');
   if (!container || !img) return;
 
-  container.querySelectorAll('.bbox-overlay, .cell-overlay').forEach(el => el.remove());
+  container.querySelectorAll('.bbox-overlay, .cell-overlay, .toc-overlay').forEach(el => el.remove());
 
   const scaleX = img.clientWidth / data.width;
   const scaleY = img.clientHeight / data.height;
@@ -384,6 +439,29 @@ function drawBoxes(data) {
     label.textContent = `${block.label} #${block.order}`;
     div.appendChild(label);
     container.appendChild(div);
+
+    // 绘制目录行覆盖层
+    if (block.toc_items && block.toc_items.length > 0) {
+      for (let ti = 0; ti < block.toc_items.length; ti++) {
+        const item = block.toc_items[ti];
+        if (!item.bbox) continue;
+        const [tx1, ty1, tx2, ty2] = item.bbox;
+        const tdiv = document.createElement('div');
+        tdiv.className = 'toc-overlay';
+        tdiv.dataset.block = blockIdx;
+        tdiv.dataset.toc = ti;
+        tdiv.style.left = (tx1 * scaleX) + 'px';
+        tdiv.style.top = (ty1 * scaleY) + 'px';
+        tdiv.style.width = ((tx2 - tx1) * scaleX) + 'px';
+        tdiv.style.height = ((ty2 - ty1) * scaleY) + 'px';
+        
+        tdiv.addEventListener('click', (e) => {
+          e.stopPropagation();
+          highlightTocItem(blockIdx, ti);
+        });
+        container.appendChild(tdiv);
+      }
+    }
 
     // 绘制单元格（可点击）
     if (block.cells && block.cells.length > 0) {
@@ -418,6 +496,15 @@ function renderResults() {
     return;
   }
 
+  const srcTag = document.getElementById('sourceTag');
+  if (data.text_source === 'ocr') {
+    srcTag.innerHTML = '<span class="source-tag ocr">OCR 识别</span>';
+  } else if (data.text_source === 'pdf') {
+    srcTag.innerHTML = '<span class="source-tag pdf">PDF 文字层</span>';
+  } else {
+    srcTag.innerHTML = '';
+  }
+
   if (data.blocks.length === 0) {
     list.innerHTML = '<div class="loading">未检测到任何区域</div>';
     return;
@@ -434,6 +521,11 @@ function renderResults() {
       } else if (b.cells === null) {
         extra = '<div class="image-hint">图片来源，无法提取单元格结构（仅 PDF 支持）</div>';
       }
+    }
+
+    // 目录展示
+    if (b.toc_items && b.toc_items.length > 0) {
+      extra = renderTocBlock(b.toc_items, idx);
     }
 
     return `<div class="block-item" data-block="${idx}" style="border-left-color:${color}; background:${color}10" onclick="highlightBlock(${idx})">
@@ -629,6 +721,22 @@ function renderTree(cells, blockIdx) {
   return html;
 }
 
+function renderTocBlock(items, blockIdx) {
+  const id = `toc-${blockIdx}`;
+  let html = `<div class="cells-toggle" onclick="event.stopPropagation(); toggleCells('${id}')">`;
+  html += `▶ ${items.length} 条目录（点击展开）</div>`;
+  html += `<div id="${id}" style="display:none"><div class="toc-list">`;
+  items.forEach((item, i) => {
+    const pg = item.page !== null ? `<span>${item.page}</span>` : '';
+    html += `<div class="toc-item" data-block="${blockIdx}" data-toc="${i}" onclick="event.stopPropagation(); highlightTocItem(${blockIdx}, ${i})">`;
+    html += `<span class="toc-title">${escHtml(item.title)}</span>`;
+    html += `<span class="toc-page">${pg}</span>`;
+    html += `</div>`;
+  });
+  html += `</div></div>`;
+  return html;
+}
+
 function toggleCells(id) {
   const el = document.getElementById(id);
   if (!el) return;
@@ -663,7 +771,7 @@ function escHtml(s, br) {
 
 // ── 点击空白取消高亮 ─────────────────────────────────────────────
 document.addEventListener('click', (e) => {
-  if (!e.target.closest('.bbox-overlay, .cell-overlay, .block-item, .cells-table')) {
+  if (!e.target.closest('.bbox-overlay, .cell-overlay, .toc-overlay, .block-item, .cells-table, .toc-item')) {
     clearHighlights();
   }
 });

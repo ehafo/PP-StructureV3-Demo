@@ -15,7 +15,7 @@ class simple_ppocr5():
         self.modal_ready=False
         self.dev_mode=False
         #parameters
-        self.limit_side_len=960
+        self.limit_side_len=1920
         # 归一化参数
         # ImageNet数据集的均值和标准差来归一化图像，即使用mean = [0.485, 0.456, 0.406]
         # 和std = [0.229, 0.224, 0.225]
@@ -25,8 +25,8 @@ class simple_ppocr5():
         #检测框体处理参数
         self.det_db_thresh = 0.3
         self.use_dilation = False
-        self.det_db_box_thresh = 0.6
-        self.det_db_unclip_ratio = 1.5
+        self.det_db_box_thresh = 0.5
+        self.det_db_unclip_ratio = 1.8
         self.max_batch_size = 10
         self.use_angle_cls = True
         self.cls_batch_num = 6
