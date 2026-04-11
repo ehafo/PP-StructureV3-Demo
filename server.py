@@ -245,19 +245,22 @@ def recognize_table_structure(image_path: str, table_bbox: list) -> dict | None:
 
     # 用 PP-OCRv5 做文字识别
     ocr = _get_ocr()
-    ocr_result = []
+    ocr_results = None
     if ocr:
         ocr.run(crop)
         if ocr.results:
-            ocr_result = [(r["rec_pos"], r["text"], 0.9) for r in ocr.results]
+            boxes = np.array([r["rec_pos"] for r in ocr.results])
+            txts = tuple(r["text"] for r in ocr.results)
+            scores = tuple(0.9 for _ in ocr.results)
+            ocr_results = [(boxes, txts, scores)]
 
     try:
-        result = engine(crop, ocr_result=ocr_result)
-        html = result.pred_html if result.pred_html else ""
+        result = engine(crop, ocr_results=ocr_results)
+        html = result.pred_htmls[0] if result.pred_htmls else ""
         # 提取单元格 bbox（转为全局坐标）
         cells = []
-        if result.cell_bboxes is not None and len(result.cell_bboxes) > 0:
-            for cb in result.cell_bboxes:
+        if result.cell_bboxes and len(result.cell_bboxes) > 0:
+            for cb in result.cell_bboxes[0]:
                 cells.append([
                     int(cb[0]) + cx1, int(cb[1]) + cy1,
                     int(cb[2]) + cx1, int(cb[3]) + cy1,
