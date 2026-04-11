@@ -1,3 +1,4 @@
+# 核心依赖
 fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 python-multipart
@@ -9,3 +10,9 @@ torchvision>=0.15.0
 onnxruntime>=1.17.0
 opencv-python-headless>=4.8.0
 rapid_table>=3.0.0
+
+# 可选：GPU 加速（有 NVIDIA GPU 时安装）
+# pip install onnxruntime-gpu  # 替代 onnxruntime
+
+# 可选：PaddlePaddle 完整产线（表格识别 v2，精度更高）
+# pip install paddlepaddle-gpu paddleocr

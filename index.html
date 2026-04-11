@@ -309,7 +309,8 @@
 /* 扫描件表格 HTML 渲染 */
 .scan-table { margin-top: 6px; overflow-x: auto; }
 .scan-table table { border-collapse: collapse; width: 100%; font-size: 11px; }
-.scan-table td, .scan-table th { border: 1px solid #ddd; padding: 3px 5px; }
+.scan-table td, .scan-table th { border: 1px solid #ddd; padding: 4px 6px; cursor: pointer; transition: all 0.15s; max-width: 200px; word-break: break-all; }
+.scan-table td.highlight { background: #fce4ec !important; outline: 2px solid #ea4335; }
 .scan-table tr:first-child td { background: #f5f5f5; font-weight: 600; }
 .image-hint {
         margin-top: 6px;
@@ -855,7 +856,33 @@
         }
       }
 
-      function highlightTocItem(blockIdx, tocIdx) {
+      function highlightScanCell(blockIdx, cellIdx) {
+  clearHighlights();
+  // 高亮图片上的覆盖层
+  const overlay = document.querySelector(`.cell-overlay[data-block="${blockIdx}"][data-scancell="${cellIdx}"]`);
+  if (overlay) {
+    overlay.classList.add('highlight');
+    const preview = document.getElementById('preview');
+    const rect = overlay.getBoundingClientRect();
+    const previewRect = preview.getBoundingClientRect();
+    if (rect.top < previewRect.top || rect.bottom > previewRect.bottom) {
+      overlay.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+  // 高亮右侧 HTML 表格中的 td
+  const td = document.querySelector(`.scan-table td[data-block="${blockIdx}"][data-scancell="${cellIdx}"]`);
+  if (td) {
+    td.classList.add('highlight');
+    td.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // 确保展开
+    const wrapper = td.closest('[id^="scan-table-"]');
+    if (wrapper && wrapper.style.display === 'none') {
+      toggleCells(wrapper.id);
+    }
+  }
+}
+
+function highlightTocItem(blockIdx, tocIdx) {
         clearHighlights();
         // 高亮图片上的 toc 覆盖层
         const overlay = document.querySelector(
@@ -1012,13 +1039,6 @@
             // 目录展示
             if (b.toc_items && b.toc_items.length > 0) {
               extra = renderTocBlock(b.toc_items, idx);
-            }
-
-            // 扫描件表格 HTML 渲染
-            if (b.table_html) {
-              const tid = `scan-table-${idx}`;
-              extra = `<div class="cells-toggle" onclick="event.stopPropagation(); toggleCells('${tid}')">▶ 扫描件表格（点击展开）</div>`;
-              extra += `<div id="${tid}" style="display:none"><div class="scan-table">${b.table_html}</div></div>`;
             }
 
             // 区域文字预览（非 table、非 toc）
@@ -1325,6 +1345,7 @@
         document.addEventListener("mousemove", (e) => {
           if (!dragging) return;
           const newW = startW - (e.clientX - startX);
+          panel.style.flex = "none";
           panel.style.width = Math.max(200, Math.min(800, newW)) + "px";
         });
 

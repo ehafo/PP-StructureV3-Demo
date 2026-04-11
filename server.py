@@ -122,22 +122,17 @@ def _get_ocr():
     dic = str(_OCR_DIR / "ppocr5_dict.txt")
     use_gpu = torch.cuda.is_available()
 
-    # GPU 用 server 版（精度高），CPU 用 mobile 版（更稳定）
-    if use_gpu and (_OCR_DIR / "ppocr5_server_det.onnx").exists():
+    # 优先 server 版（精度高），没有则 mobile 版
+    if (_OCR_DIR / "ppocr5_server_det.onnx").exists():
         det = str(_OCR_DIR / "ppocr5_server_det.onnx")
         rec = str(_OCR_DIR / "ppocr5_server_rec.onnx")
         _ocr_model_type = "server"
-        log.info("使用 PP-OCRv5 server 版模型 (GPU)")
+        log.info(f"使用 PP-OCRv5 server 版模型 (GPU={use_gpu})")
     elif (_OCR_DIR / "ppocr5_mobile_det.onnx").exists():
         det = str(_OCR_DIR / "ppocr5_mobile_det.onnx")
         rec = str(_OCR_DIR / "ppocr5_mobile_rec.onnx")
         _ocr_model_type = "mobile"
-        log.info("使用 PP-OCRv5 mobile 版模型 (CPU)")
-    elif (_OCR_DIR / "ppocr5_server_det.onnx").exists():
-        det = str(_OCR_DIR / "ppocr5_server_det.onnx")
-        rec = str(_OCR_DIR / "ppocr5_server_rec.onnx")
-        _ocr_model_type = "server"
-        log.info("使用 PP-OCRv5 server 版模型 (fallback)")
+        log.info("使用 PP-OCRv5 mobile 版模型")
     else:
         log.warning("OCR 模型未找到，扫描件将无法识别文字")
         return None
@@ -203,32 +198,119 @@ def ocr_blocks(image_path: str, blocks: list[dict]) -> dict[int, list[dict]]:
 
 
 # ── 表格结构识别（扫描件）────────────────────────────────────────
+# 优先用 PaddlePaddle 的 TableRecognitionPipelineV2（完整产线），
+# 没有 PaddlePaddle 则降级为 RapidTable（ONNX）
 _table_engine = None
+_table_engine_type = ""  # "paddle" | "rapid" | ""
 
 
 def _get_table_engine():
-    global _table_engine
+    global _table_engine, _table_engine_type
     if _table_engine is not None:
         return _table_engine
+
+    # 优先尝试 PaddlePaddle 完整产线
+    try:
+        from paddleocr import TableRecognitionPipelineV2
+        device = "gpu:0" if torch.cuda.is_available() else "cpu"
+        _table_engine = TableRecognitionPipelineV2(device=device)
+        _table_engine_type = "paddle"
+        log.info(f"表格识别引擎: PaddlePaddle TableRecognitionPipelineV2 ({device})")
+        return _table_engine
+    except ImportError:
+        log.info("PaddlePaddle 未安装，尝试 RapidTable 降级方案")
+    except Exception as e:
+        log.warning(f"PaddlePaddle 表格产线初始化失败: {e}，尝试 RapidTable")
+
+    # 降级为 RapidTable（ONNX）
     try:
         from rapid_table import ModelType, RapidTable, RapidTableInput
         input_args = RapidTableInput(model_type=ModelType.SLANETPLUS)
         _table_engine = RapidTable(input_args)
-        log.info("表格结构识别模型加载完成 (SLANet_plus)")
+        _table_engine_type = "rapid"
+        log.info("表格识别引擎: RapidTable (SLANet_plus ONNX)")
     except Exception as e:
-        log.error(f"表格结构识别模型加载失败: {e}")
+        log.error(f"表格识别引擎加载失败: {e}")
+
     return _table_engine
 
 
 def recognize_table_structure(image_path: str, table_bbox: list) -> dict | None:
-    """对扫描件中的表格区域做结构识别。
-    返回 {"html": ..., "cells": [...]} 或 None。
-    """
-    import cv2
+    """对扫描件中的表格区域做结构识别。返回 {"cells": [...]} 或 None。"""
     engine = _get_table_engine()
     if engine is None:
         return None
 
+    if _table_engine_type == "paddle":
+        return _recognize_table_paddle(engine, image_path, table_bbox)
+    else:
+        return _recognize_table_rapid(engine, image_path, table_bbox)
+
+
+def _recognize_table_paddle(engine, image_path: str, table_bbox: list) -> dict | None:
+    """用 PaddlePaddle TableRecognitionPipelineV2 识别表格"""
+    import cv2
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    x1, y1, x2, y2 = table_bbox
+    pad = 5
+    cx1 = max(0, x1 - pad)
+    cy1 = max(0, y1 - pad)
+    cx2 = min(img.shape[1], x2 + pad)
+    cy2 = min(img.shape[0], y2 + pad)
+    crop = img[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return None
+
+    try:
+        results = list(engine.predict(crop))
+        if not results:
+            return None
+
+        res = results[0]
+        data = res.json if hasattr(res, 'json') else {}
+
+        # 从结果中提取 HTML
+        html = ""
+        if hasattr(res, 'html') and res.html:
+            html = res.html
+        elif "html" in data:
+            html = data["html"]
+
+        # 尝试从 parsing_res_list 提取单元格
+        cells = []
+        parsing_list = data.get("parsing_res_list", [])
+        if parsing_list:
+            for item in parsing_list:
+                cell_bbox = item.get("cell_bbox") or item.get("block_bbox", [])
+                if len(cell_bbox) >= 4:
+                    cells.append({
+                        "row": item.get("row_start", 0),
+                        "col": item.get("col_start", 0),
+                        "text": item.get("cell_content", item.get("block_content", "")),
+                        "bbox": [
+                            int(cell_bbox[0]) + cx1, int(cell_bbox[1]) + cy1,
+                            int(cell_bbox[2]) + cx1, int(cell_bbox[3]) + cy1,
+                        ],
+                    })
+
+        # 如果没有从 parsing_res_list 拿到 cells，从 HTML 解析
+        if not cells and html:
+            cells = _parse_html_table(html, None, cx1, cy1)
+
+        log.info(f"PaddlePaddle 表格识别完成: {len(cells)} 个单元格")
+        return {"cells": cells} if cells else None
+
+    except Exception as e:
+        log.error(f"PaddlePaddle 表格识别失败: {e}")
+        return None
+
+
+def _recognize_table_rapid(engine, image_path: str, table_bbox: list) -> dict | None:
+    """用 RapidTable (ONNX) 识别表格"""
+    import cv2
     img = cv2.imread(image_path)
     if img is None:
         return None
@@ -257,19 +339,97 @@ def recognize_table_structure(image_path: str, table_bbox: list) -> dict | None:
     try:
         result = engine(crop, ocr_results=ocr_results)
         html = result.pred_htmls[0] if result.pred_htmls else ""
-        # 提取单元格 bbox（转为全局坐标）
-        cells = []
-        if result.cell_bboxes and len(result.cell_bboxes) > 0:
-            for cb in result.cell_bboxes[0]:
-                cells.append([
-                    int(cb[0]) + cx1, int(cb[1]) + cy1,
-                    int(cb[2]) + cx1, int(cb[3]) + cy1,
-                ])
-        log.info(f"表格结构识别完成: {len(cells)} 个单元格")
-        return {"html": html, "cells": cells}
+        if not html:
+            return None
+
+        cells = _parse_html_table(html, result.cell_bboxes, cx1, cy1)
+        log.info(f"RapidTable 表格识别完成: {len(cells)} 个单元格")
+        return {"cells": cells}
     except Exception as e:
-        log.error(f"表格结构识别失败: {e}")
+        log.error(f"RapidTable 表格识别失败: {e}")
         return None
+
+
+def _parse_html_table(html: str, cell_bboxes_batch, offset_x: int, offset_y: int) -> list[dict]:
+    """将 RapidTable 的 HTML 表格解析为 [{row, col, text, bbox}] 格式"""
+    from html.parser import HTMLParser
+
+    class TableParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.cells = []
+            self.row = -1
+            self.col = 0
+            self.in_td = False
+            self.current_text = ""
+            self.col_spans = {}  # row -> set of occupied cols
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "tr":
+                self.row += 1
+                self.col = 0
+                # 跳过被 rowspan 占用的列
+                while (self.row, self.col) in self.col_spans:
+                    self.col += 1
+            elif tag == "td":
+                self.in_td = True
+                self.current_text = ""
+                # 跳过被 rowspan 占用的列
+                while (self.row, self.col) in self.col_spans:
+                    self.col += 1
+                # 处理 colspan/rowspan
+                colspan = 1
+                rowspan = 1
+                for k, v in attrs:
+                    if k == "colspan":
+                        colspan = int(v)
+                    elif k == "rowspan":
+                        rowspan = int(v)
+                self._colspan = colspan
+                self._rowspan = rowspan
+
+        def handle_data(self, data):
+            if self.in_td:
+                self.current_text += data
+
+        def handle_endtag(self, tag):
+            if tag == "td" and self.in_td:
+                self.in_td = False
+                self.cells.append({
+                    "row": self.row,
+                    "col": self.col,
+                    "text": self.current_text.strip(),
+                })
+                # 标记 rowspan 占用的位置
+                for dr in range(self._rowspan):
+                    for dc in range(self._colspan):
+                        if dr > 0 or dc > 0:
+                            self.col_spans[(self.row + dr, self.col + dc)] = True
+                self.col += self._colspan
+
+    parser = TableParser()
+    parser.feed(html)
+
+    # 分配 bbox：先转为全局坐标，再按空间位置匹配
+    bboxes = []
+    if cell_bboxes_batch and len(cell_bboxes_batch) > 0:
+        bboxes = []
+        for cb in cell_bboxes_batch[0]:
+            # cb 是 8 值四边形 [x1,y1,x2,y2,x3,y3,x4,y4]，取外接矩形
+            xs = [float(cb[i]) for i in range(0, len(cb), 2)]
+            ys = [float(cb[i]) for i in range(1, len(cb), 2)]
+            bboxes.append([
+                int(min(xs)) + offset_x, int(min(ys)) + offset_y,
+                int(max(xs)) + offset_x, int(max(ys)) + offset_y,
+            ])
+
+    for i, cell in enumerate(parser.cells):
+        if i < len(bboxes):
+            cell["bbox"] = bboxes[i]
+        else:
+            cell["bbox"] = [0, 0, 0, 0]
+
+    return parser.cells
 
 
 # ── 目录行解析 ────────────────────────────────────────────────────
@@ -373,12 +533,10 @@ async def model_status():
     ocr_available = (_OCR_DIR / "ppocr5_server_det.onnx").exists() or (_OCR_DIR / "ppocr5_mobile_det.onnx").exists()
     if _ocr_model_type:
         ocr_model = _ocr_model_type
-    elif torch.cuda.is_available() and (_OCR_DIR / "ppocr5_server_det.onnx").exists():
+    elif (_OCR_DIR / "ppocr5_server_det.onnx").exists():
         ocr_model = "server"
     elif (_OCR_DIR / "ppocr5_mobile_det.onnx").exists():
         ocr_model = "mobile"
-    elif (_OCR_DIR / "ppocr5_server_det.onnx").exists():
-        ocr_model = "server"
     else:
         ocr_model = ""
     gpu = torch.cuda.is_available()
@@ -387,6 +545,7 @@ async def model_status():
         "status": _model_status, "error": _model_error,
         "ocr_available": ocr_available, "ocr_model": ocr_model,
         "gpu": gpu, "gpu_name": gpu_name,
+        "table_engine": _table_engine_type or "none",
     }
 
 
@@ -604,15 +763,8 @@ def build_structured(blocks: list, pdf_path: str | None, page_num: int,
 
             content.append({"type": "table", "headers": headers, "rows": rows})
 
-        # 表格（扫描件，有结构识别结果）
-        elif label == "table" and block.get("table_html"):
-            content.append({
-                "type": "table_html",
-                "html": block["table_html"],
-            })
-
         # 表格（扫描件，无结构识别）
-        elif label == "table" and block.get("cells") is None and not block.get("table_html"):
+        elif label == "table" and block.get("cells") is None:
             text = get_text(idx, block["bbox"])
             if text:
                 content.append({"type": "table_text", "text": _clean_text(text),
@@ -757,10 +909,8 @@ async def detect(doc_id: str, page_num: int):
             else:
                 # 扫描件：用 RapidTable 做表格结构识别
                 table_result = recognize_table_structure(str(img_path), block["bbox"])
-                if table_result:
-                    block["cells"] = None
-                    block["table_html"] = table_result["html"]
-                    block["table_cell_bboxes"] = table_result["cells"]
+                if table_result and table_result["cells"]:
+                    block["cells"] = table_result["cells"]
                 else:
                     block["cells"] = None
 
