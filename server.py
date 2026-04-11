@@ -764,6 +764,15 @@ async def detect(doc_id: str, page_num: int):
                 else:
                     block["cells"] = None
 
+    # 给每个 block 挂上提取到的文字（供前端可视化显示）
+    for idx, block in enumerate(blocks):
+        if block.get("cells") or block.get("table_html"):
+            continue  # 表格有自己的展示方式
+        if has_text_layer and is_pdf:
+            block["ocr_text"] = extract_text_from_pdf(str(pdf_path), page_num, block["bbox"])
+        elif ocr_by_block and idx in ocr_by_block:
+            block["ocr_text"] = "\n".join(it["text"] for it in ocr_by_block[idx])
+
     structured = build_structured(
         blocks, str(pdf_path) if is_pdf else None, page_num,
         str(img_path), has_text_layer, ocr_by_block
