@@ -238,6 +238,7 @@
         cursor: pointer;
         transition: all 0.15s;
         word-break: break-all;
+        white-space: pre-line;
       }
       .cells-table td:hover {
         background: #fef9e7;
@@ -645,20 +646,26 @@
       let modelReady = false;
       (async function pollModelStatus() {
         const el = document.getElementById("modelStatus");
-        while (!modelReady) {
+        while (true) {
           try {
             const res = await fetch("/api/model-status");
             const data = await res.json();
             if (data.status === "ready") {
-              modelReady = true;
               const ocrLabel = data.ocr_model
                 ? ` | OCR: ${data.ocr_model}`
                 : "";
               const gpuLabel = data.gpu ? ` | GPU: ${data.gpu_name}` : " | CPU";
-              el.textContent = "模型就绪" + gpuLabel + ocrLabel;
+              const tableLabel = data.table_engine && data.table_engine !== "none"
+                ? ` | 表格: ${data.table_engine === "paddle" ? "PP-TableMagic V2" : "RapidTable"}`
+                : "";
+              el.textContent = "模型就绪" + gpuLabel + ocrLabel + tableLabel;
               el.style.background = "#34a853";
-              document.getElementById("detectBtn").disabled = !state.activePage;
-              return;
+              if (!modelReady) {
+                modelReady = true;
+                document.getElementById("detectBtn").disabled = !state.activePage;
+              }
+              // 表格引擎也就绪后停止轮询
+              if (data.table_engine && data.table_engine !== "none") return;
             } else if (data.status === "error") {
               el.textContent = "模型加载失败";
               el.style.background = "#ea4335";

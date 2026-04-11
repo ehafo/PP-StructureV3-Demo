@@ -1,7 +1,12 @@
 """PP-StructureV3 版面结构化演示
 - 版面检测：PP-DocLayoutV3 (HuggingFace transformers + PyTorch)
 - 文本提取：PyMuPDF（文本型 PDF）/ PP-OCRv5 ONNX（扫描件，全页 OCR + 按区域归类）
-- 表格提取：PyMuPDF"""
+- 表格提取：PyMuPDF（文本型 PDF）/ PP-TableMagic V2 完整产线（扫描件）
+  · 表格分类（有线/无线自动区分）
+  · 单元格检测 (RT-DETR-L)
+  · 结构识别 (SLANeXt)
+  · 文字检测+识别 (PP-OCRv4)
+  · 降级方案：RapidTable (SLANet_plus ONNX)"""
 
 import re
 import time
@@ -197,9 +202,9 @@ def ocr_blocks(image_path: str, blocks: list[dict]) -> dict[int, list[dict]]:
     return result
 
 
-# ── 表格结构识别（扫描件）────────────────────────────────────────
-# 优先用 PaddlePaddle 的 TableRecognitionPipelineV2（完整产线），
-# 没有 PaddlePaddle 则降级为 RapidTable（ONNX）
+# ── 表格结构识别（扫描件）── PP-TableMagic V2 ────────────────────
+# 优先用 PP-TableMagic V2 完整产线（表格分类+单元格检测+结构识别+OCR），
+# 没有 PaddlePaddle 则降级为 RapidTable (SLANet_plus ONNX)
 _table_engine = None
 _table_engine_type = ""  # "paddle" | "rapid" | ""
 
@@ -209,18 +214,25 @@ def _get_table_engine():
     if _table_engine is not None:
         return _table_engine
 
-    # 优先尝试 PaddlePaddle 完整产线
+    # 优先尝试 PaddlePaddle PP-TableMagic 完整产线（V2）
+    # 注意：当前 paddlepaddle-gpu 3.x 尚未发布，使用 CPU 版 Paddle 3.0 推理。
+    # 版面检测（PyTorch）和 OCR（ONNX）仍走 GPU，仅表格结构识别走 Paddle CPU。
     try:
         from paddleocr import TableRecognitionPipelineV2
-        device = "gpu:0" if torch.cuda.is_available() else "cpu"
-        _table_engine = TableRecognitionPipelineV2(device=device)
+        _table_engine = TableRecognitionPipelineV2(
+            device="cpu",
+            use_layout_detection=False,          # 已有 PP-DocLayoutV3，不需要 V2 二次检测
+            use_doc_orientation_classify=False,   # 裁切后的表格区域不需要方向矫正
+            use_doc_unwarping=False,              # 裁切后的表格区域不需要弯曲矫正
+        )
         _table_engine_type = "paddle"
-        log.info(f"表格识别引擎: PaddlePaddle TableRecognitionPipelineV2 ({device})")
+        log.info("表格识别引擎: PP-TableMagic V2 (cpu) — "
+                 "表格分类+单元格检测+结构识别+OCR")
         return _table_engine
     except ImportError:
         log.info("PaddlePaddle 未安装，尝试 RapidTable 降级方案")
     except Exception as e:
-        log.warning(f"PaddlePaddle 表格产线初始化失败: {e}，尝试 RapidTable")
+        log.warning(f"PP-TableMagic V2 初始化失败: {e}，尝试 RapidTable")
 
     # 降级为 RapidTable（ONNX）
     try:
@@ -248,7 +260,13 @@ def recognize_table_structure(image_path: str, table_bbox: list) -> dict | None:
 
 
 def _recognize_table_paddle(engine, image_path: str, table_bbox: list) -> dict | None:
-    """用 PaddlePaddle TableRecognitionPipelineV2 识别表格"""
+    """用 PP-TableMagic V2 完整产线识别表格。
+
+    V2 产线内置：表格分类（有线/无线）→ 单元格检测 (RT-DETR-L)
+    → 结构识别 (SLANeXt) → 文字检测+识别 (PP-OCRv4)。
+    用 pred_html 获取行列结构，用 cell_box_list 获取坐标，
+    用 table_ocr_pred 的 rec_texts/rec_boxes 恢复单元格内换行。
+    """
     import cv2
     img = cv2.imread(image_path)
     if img is None:
@@ -270,41 +288,85 @@ def _recognize_table_paddle(engine, image_path: str, table_bbox: list) -> dict |
             return None
 
         res = results[0]
+
+        # 从 json 结构中提取各项数据
         data = res.json if hasattr(res, 'json') else {}
+        inner = data.get("res", data) if isinstance(data, dict) else {}
+        table_res_list = inner.get("table_res_list", [])
 
-        # 从结果中提取 HTML
-        html = ""
-        if hasattr(res, 'html') and res.html:
-            html = res.html
-        elif "html" in data:
-            html = data["html"]
+        pred_html = ""
+        cell_boxes = []
+        ocr_data = {}
+        if table_res_list:
+            pred_html = table_res_list[0].get("pred_html", "")
+            cell_boxes = table_res_list[0].get("cell_box_list", [])
+            ocr_data = table_res_list[0].get("table_ocr_pred", {})
 
-        # 尝试从 parsing_res_list 提取单元格
-        cells = []
-        parsing_list = data.get("parsing_res_list", [])
-        if parsing_list:
-            for item in parsing_list:
-                cell_bbox = item.get("cell_bbox") or item.get("block_bbox", [])
-                if len(cell_bbox) >= 4:
-                    cells.append({
-                        "row": item.get("row_start", 0),
-                        "col": item.get("col_start", 0),
-                        "text": item.get("cell_content", item.get("block_content", "")),
-                        "bbox": [
-                            int(cell_bbox[0]) + cx1, int(cell_bbox[1]) + cy1,
-                            int(cell_bbox[2]) + cx1, int(cell_bbox[3]) + cy1,
-                        ],
-                    })
+        # 回退：从 res.html 取 HTML
+        if not pred_html and hasattr(res, 'html') and isinstance(res.html, dict):
+            for key in sorted(res.html):
+                pred_html = res.html[key]
+                break
 
-        # 如果没有从 parsing_res_list 拿到 cells，从 HTML 解析
-        if not cells and html:
-            cells = _parse_html_table(html, None, cx1, cy1)
+        if not pred_html:
+            log.info("PP-TableMagic V2: 未检测到表格")
+            return None
 
-        log.info(f"PaddlePaddle 表格识别完成: {len(cells)} 个单元格")
+        # ── 第1步：用 pred_html 解析行列结构，用 cell_box_list 提供 bbox ──
+        bboxes_batch = None
+        if cell_boxes:
+            quads = []
+            for cb in cell_boxes:
+                x1b, y1b, x2b, y2b = cb[0], cb[1], cb[2], cb[3]
+                quads.append([x1b, y1b, x2b, y1b, x2b, y2b, x1b, y2b])
+            bboxes_batch = [quads]
+
+        cells = _parse_html_table(pred_html, bboxes_batch, cx1, cy1)
+
+        # ── 第2步：用 OCR 逐行���字 + 坐标恢复单元格内换行 ──
+        ocr_texts = ocr_data.get("rec_texts", []) if isinstance(ocr_data, dict) else []
+        ocr_boxes = ocr_data.get("rec_boxes", []) if isinstance(ocr_data, dict) else []
+
+        if cell_boxes and ocr_texts and ocr_boxes:
+            # 把每条 OCR 文字按中心点分配到最近的单元格
+            # 格式: {cell_idx: [(y_center, text), ...]}
+            text_by_cell = {}
+            for t_idx, txt in enumerate(ocr_texts):
+                if t_idx >= len(ocr_boxes):
+                    break
+                tb = ocr_boxes[t_idx]  # [x1, y1, x2, y2]
+                tcx = (tb[0] + tb[2]) / 2
+                tcy = (tb[1] + tb[3]) / 2
+                # 找包含���文字中心点的单元格
+                best_cell = -1
+                for ci, cb in enumerate(cell_boxes):
+                    if cb[0] <= tcx <= cb[2] and cb[1] <= tcy <= cb[3]:
+                        best_cell = ci
+                        break
+                if best_cell == -1:
+                    # 中心点不在任何单元格内，找最近的
+                    min_dist = float('inf')
+                    for ci, cb in enumerate(cell_boxes):
+                        ccx = (cb[0] + cb[2]) / 2
+                        ccy = (cb[1] + cb[3]) / 2
+                        dist = (tcx - ccx) ** 2 + (tcy - ccy) ** 2
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_cell = ci
+                if best_cell >= 0:
+                    text_by_cell.setdefault(best_cell, []).append((tcy, txt))
+
+            # 用按 Y 排序的 OCR 文字替换 HTML 解析出的文字（恢复换行）
+            for ci, lines in text_by_cell.items():
+                if ci < len(cells):
+                    lines.sort(key=lambda x: x[0])  # 按 Y 坐标从上到下
+                    cells[ci]["text"] = "\n".join(t for _, t in lines)
+
+        log.info(f"PP-TableMagic V2 表格识别完成: {len(cells)} 个单元格")
         return {"cells": cells} if cells else None
 
     except Exception as e:
-        log.error(f"PaddlePaddle 表格识别失败: {e}")
+        log.error(f"PP-TableMagic V2 表格识别失败: {e}")
         return None
 
 
@@ -526,6 +588,7 @@ def page_has_text(pdf_path: str, page_num: int) -> bool:
 async def startup_event():
     threading.Thread(target=_load_model, daemon=True).start()
     threading.Thread(target=_download_ocr_models, daemon=True).start()
+    threading.Thread(target=_get_table_engine, daemon=True).start()
 
 
 @app.get("/api/model-status")
@@ -618,6 +681,8 @@ def detect_layout(image_path: str) -> list[dict]:
         b["order"] = i
 
     log.info(f"检测到 {len(blocks)} 个区域")
+    for b in blocks:
+        log.info(f"  [{b['order']}] {b['label']:12s} score={b['score']:.3f} bbox={b['bbox']}")
     return blocks
 
 
@@ -907,7 +972,7 @@ async def detect(doc_id: str, page_num: int):
                     str(pdf_path), page_num, block["bbox"], w, h
                 )
             else:
-                # 扫描件：用 RapidTable 做表格结构识别
+                # 扫描件：用 PP-TableMagic V2 做表格结构识别
                 table_result = recognize_table_structure(str(img_path), block["bbox"])
                 if table_result and table_result["cells"]:
                     block["cells"] = table_result["cells"]
@@ -1004,4 +1069,4 @@ async def delete_doc(doc_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3001)
+    uvicorn.run(app, host="0.0.0.0", port=3003)
