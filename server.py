@@ -80,11 +80,43 @@ _OCR_DIR = Path("model/ocr")
 _ocr_engine = None
 _ocr_model_type = ""  # "server" | "mobile" | ""
 
+# HuggingFace 下载映射：(repo_id, remote_filename) → local_filename
+_OCR_MODELS = {
+    "ppocr5_server_det.onnx": ("marsena/paddleocr-onnx-models", "PP-OCRv5_server_det_infer.onnx"),
+    "ppocr5_server_rec.onnx": ("marsena/paddleocr-onnx-models", "PP-OCRv5_server_rec_infer.onnx"),
+    "ppocr5_cls.onnx":        ("SWHL/RapidOCR", "PP-OCRv1/ch_ppocr_mobile_v2.0_cls_infer.onnx"),
+    "ppocr5_dict.txt":        ("AXERA-TECH/PPOCR_v5", "ppocrv5_dict.txt"),
+}
+
+
+def _download_ocr_models():
+    """Download OCR models from HuggingFace if not present."""
+    from huggingface_hub import hf_hub_download
+
+    _OCR_DIR.mkdir(parents=True, exist_ok=True)
+    for local_name, (repo_id, remote_name) in _OCR_MODELS.items():
+        local_path = _OCR_DIR / local_name
+        if local_path.exists():
+            continue
+        log.info(f"下载 OCR 模型: {local_name} ← {repo_id}/{remote_name}")
+        downloaded = hf_hub_download(repo_id=repo_id, filename=remote_name)
+        # Copy to local dir with our naming convention
+        import shutil as _shutil
+        _shutil.copy2(downloaded, str(local_path))
+        log.info(f"OCR 模型已保存: {local_path}")
+
 
 def _get_ocr():
     global _ocr_engine, _ocr_model_type
     if _ocr_engine is not None:
         return _ocr_engine
+
+    # Auto-download if missing
+    if not (_OCR_DIR / "ppocr5_server_det.onnx").exists():
+        try:
+            _download_ocr_models()
+        except Exception as e:
+            log.error(f"OCR 模型下载失败: {e}")
 
     cls = str(_OCR_DIR / "ppocr5_cls.onnx")
     dic = str(_OCR_DIR / "ppocr5_dict.txt")
@@ -263,6 +295,7 @@ def page_has_text(pdf_path: str, page_num: int) -> bool:
 @app.on_event("startup")
 async def startup_event():
     threading.Thread(target=_load_model, daemon=True).start()
+    threading.Thread(target=_download_ocr_models, daemon=True).start()
 
 
 @app.get("/api/model-status")
@@ -278,23 +311,38 @@ async def model_status():
         ocr_model = "server"
     else:
         ocr_model = ""
-    return {"status": _model_status, "error": _model_error, "ocr_available": ocr_available, "ocr_model": ocr_model}
+    gpu = torch.cuda.is_available()
+    gpu_name = torch.cuda.get_device_name(0) if gpu else ""
+    return {
+        "status": _model_status, "error": _model_error,
+        "ocr_available": ocr_available, "ocr_model": ocr_model,
+        "gpu": gpu, "gpu_name": gpu_name,
+    }
 
 
-# ── PDF → 图片 + 保留原始 PDF ──────────────────────────────────────
-def pdf_to_images(pdf_bytes: bytes, doc_dir: Path) -> list[str]:
+# ── PDF 保存 + 按需渲染 ──────────────────────────────────────────────
+def pdf_save_and_count(pdf_bytes: bytes, doc_dir: Path) -> int:
+    """Save PDF and return page count without rendering any images."""
     (doc_dir / "source.pdf").write_bytes(pdf_bytes)
-
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    filenames = []
-    matrix = fitz.Matrix(2.0, 2.0)
-    for i, page in enumerate(doc, 1):
-        pix = page.get_pixmap(matrix=matrix)
-        name = f"page_{i:03d}.png"
-        pix.save(str(doc_dir / name))
-        filenames.append(name)
+    count = len(doc)
     doc.close()
-    return filenames
+    return count
+
+
+def ensure_page_image(doc_dir: Path, page_num: int) -> Path:
+    """Render a single page PNG on demand, return its path."""
+    img_path = doc_dir / f"page_{page_num:03d}.png"
+    if not img_path.exists():
+        pdf_path = doc_dir / "source.pdf"
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"source.pdf not found in {doc_dir}")
+        doc = fitz.open(str(pdf_path))
+        page = doc[page_num - 1]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        pix.save(str(img_path))
+        doc.close()
+    return img_path
 
 
 # ── 版面检测 ───────────────────────────────────────────────────────
@@ -552,7 +600,8 @@ async def upload(file: UploadFile = File(...)):
     is_pdf = file.filename.lower().endswith(".pdf")
 
     if is_pdf:
-        filenames = pdf_to_images(content, doc_dir)
+        page_count = pdf_save_and_count(content, doc_dir)
+        filenames = [f"page_{i:03d}.png" for i in range(1, page_count + 1)]
     else:
         name = f"page_001{Path(file.filename).suffix}"
         (doc_dir / name).write_bytes(content)
@@ -568,9 +617,17 @@ async def upload(file: UploadFile = File(...)):
 
 @app.get("/api/images/{doc_id}/{filename}")
 async def get_image(doc_id: str, filename: str):
-    path = UPLOAD_DIR / doc_id / filename
+    doc_dir = UPLOAD_DIR / doc_id
+    path = doc_dir / filename
     if not path.exists():
-        return {"error": "not found"}
+        if filename.startswith("page_") and filename.endswith(".png"):
+            page_num = int(filename.split("_")[1].split(".")[0])
+            try:
+                ensure_page_image(doc_dir, page_num)
+            except (FileNotFoundError, IndexError):
+                return {"error": "not found"}
+        else:
+            return {"error": "not found"}
     return FileResponse(path)
 
 
@@ -588,9 +645,9 @@ async def text_source(doc_id: str, page_num: int):
 @app.post("/api/detect/{doc_id}/{page_num}")
 async def detect(doc_id: str, page_num: int):
     doc_dir = UPLOAD_DIR / doc_id
-    name = f"page_{page_num:03d}.png"
-    img_path = doc_dir / name
-    if not img_path.exists():
+    try:
+        img_path = ensure_page_image(doc_dir, page_num)
+    except FileNotFoundError:
         return {"error": "page not found"}
 
     blocks = detect_layout(str(img_path))
@@ -645,9 +702,19 @@ async def detect_all(doc_id: str):
     pdf_path = doc_dir / "source.pdf"
     is_pdf = pdf_path.exists()
 
+    if is_pdf:
+        doc = fitz.open(str(pdf_path))
+        total_pages = len(doc)
+        doc.close()
+    else:
+        total_pages = len(list(doc_dir.glob("page_*.*")))
+
     pages_result = []
-    for img_path in sorted(doc_dir.glob("page_*.png")):
-        page_num = int(img_path.stem.split("_")[1])
+    for page_num in range(1, total_pages + 1):
+        try:
+            img_path = ensure_page_image(doc_dir, page_num)
+        except FileNotFoundError:
+            continue
         blocks = detect_layout(str(img_path))
         with Image.open(img_path) as img:
             w, h = img.size
