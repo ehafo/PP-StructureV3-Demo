@@ -202,6 +202,73 @@ def ocr_blocks(image_path: str, blocks: list[dict]) -> dict[int, list[dict]]:
     return result
 
 
+# ── 表格结构识别（扫描件）────────────────────────────────────────
+_table_engine = None
+
+
+def _get_table_engine():
+    global _table_engine
+    if _table_engine is not None:
+        return _table_engine
+    try:
+        from rapid_table import ModelType, RapidTable, RapidTableInput
+        input_args = RapidTableInput(model_type=ModelType.SLANETPLUS)
+        _table_engine = RapidTable(input_args)
+        log.info("表格结构识别模型加载完成 (SLANet_plus)")
+    except Exception as e:
+        log.error(f"表格结构识别模型加载失败: {e}")
+    return _table_engine
+
+
+def recognize_table_structure(image_path: str, table_bbox: list) -> dict | None:
+    """对扫描件中的表格区域做结构识别。
+    返回 {"html": ..., "cells": [...]} 或 None。
+    """
+    import cv2
+    engine = _get_table_engine()
+    if engine is None:
+        return None
+
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    x1, y1, x2, y2 = table_bbox
+    pad = 5
+    cx1 = max(0, x1 - pad)
+    cy1 = max(0, y1 - pad)
+    cx2 = min(img.shape[1], x2 + pad)
+    cy2 = min(img.shape[0], y2 + pad)
+    crop = img[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return None
+
+    # 用 PP-OCRv5 做文字识别
+    ocr = _get_ocr()
+    ocr_result = []
+    if ocr:
+        ocr.run(crop)
+        if ocr.results:
+            ocr_result = [(r["rec_pos"], r["text"], 0.9) for r in ocr.results]
+
+    try:
+        result = engine(crop, ocr_result=ocr_result)
+        html = result.pred_html if result.pred_html else ""
+        # 提取单元格 bbox（转为全局坐标）
+        cells = []
+        if result.cell_bboxes is not None and len(result.cell_bboxes) > 0:
+            for cb in result.cell_bboxes:
+                cells.append([
+                    int(cb[0]) + cx1, int(cb[1]) + cy1,
+                    int(cb[2]) + cx1, int(cb[3]) + cy1,
+                ])
+        log.info(f"表格结构识别完成: {len(cells)} 个单元格")
+        return {"html": html, "cells": cells}
+    except Exception as e:
+        log.error(f"表格结构识别失败: {e}")
+        return None
+
+
 # ── 目录行解析 ────────────────────────────────────────────────────
 def _parse_toc_line(line: str) -> dict | None:
     """解析目录行，拆分标题和页码。
@@ -534,8 +601,15 @@ def build_structured(blocks: list, pdf_path: str | None, page_num: int,
 
             content.append({"type": "table", "headers": headers, "rows": rows})
 
-        # 表格（扫描件，无单元格）
-        elif label == "table" and block.get("cells") is None:
+        # 表格（扫描件，有结构识别结果）
+        elif label == "table" and block.get("table_html"):
+            content.append({
+                "type": "table_html",
+                "html": block["table_html"],
+            })
+
+        # 表格（扫描件，无结构识别）
+        elif label == "table" and block.get("cells") is None and not block.get("table_html"):
             text = get_text(idx, block["bbox"])
             if text:
                 content.append({"type": "table_text", "text": _clean_text(text),
@@ -678,7 +752,14 @@ async def detect(doc_id: str, page_num: int):
                     str(pdf_path), page_num, block["bbox"], w, h
                 )
             else:
-                block["cells"] = None
+                # 扫描件：用 RapidTable 做表格结构识别
+                table_result = recognize_table_structure(str(img_path), block["bbox"])
+                if table_result:
+                    block["cells"] = None
+                    block["table_html"] = table_result["html"]
+                    block["table_cell_bboxes"] = table_result["cells"]
+                else:
+                    block["cells"] = None
 
     structured = build_structured(
         blocks, str(pdf_path) if is_pdf else None, page_num,
