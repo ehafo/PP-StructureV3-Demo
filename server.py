@@ -684,6 +684,35 @@ def ensure_page_image(doc_dir: Path, page_num: int) -> Path:
     return img_path
 
 
+def _sort_reading_order(blocks: list[dict], y_tolerance: int = 30) -> list[dict]:
+    """按阅读顺序排序：将 y 坐标相近的 block 分到同一行，行内按 x 排序。
+    解决双栏布局中右列 y 略小于左列导致排序错误的问题。
+    """
+    if not blocks:
+        return blocks
+
+    sorted_by_y = sorted(blocks, key=lambda b: b["bbox"][1])
+
+    rows = []
+    current_row = [sorted_by_y[0]]
+    row_y = sorted_by_y[0]["bbox"][1]
+
+    for b in sorted_by_y[1:]:
+        if b["bbox"][1] - row_y <= y_tolerance:
+            current_row.append(b)
+        else:
+            rows.append(current_row)
+            current_row = [b]
+            row_y = b["bbox"][1]
+    rows.append(current_row)
+
+    result = []
+    for row in rows:
+        row.sort(key=lambda b: b["bbox"][0])
+        result.extend(row)
+    return result
+
+
 # ── 版面检测 ───────────────────────────────────────────────────────
 def detect_layout(image_path: str) -> list[dict]:
     _ensure_model()
@@ -723,7 +752,7 @@ def detect_layout(image_path: str) -> list[dict]:
         kept.append(b)
     blocks = kept
 
-    blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+    blocks = _sort_reading_order(blocks)
     for i, b in enumerate(blocks):
         b["order"] = i
 
