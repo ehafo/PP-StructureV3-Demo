@@ -147,10 +147,8 @@ def _get_ocr():
         ppocr5_onnx_det=det, ppocr5_onnx_cls=cls,
         ppocr5_onnx_rec=rec, ppcor5_dict=dic, use_gpu=use_gpu,
     )
-    # 调整检测参数，减少重叠框导致的字符重复
-    _ocr_engine.det_db_unclip_ratio = 1.5   # 默认 1.8，降低以避免框扩张后相互重叠
-    _ocr_engine.det_db_box_thresh = 0.6     # 默认 0.5，提高以减少低置信度的重复检测
-    log.info(f"OCR 模型加载完成 (GPU={use_gpu}, unclip=1.5, box_thresh=0.6)")
+    # 保持默认参数（unclip=1.8, box_thresh=0.5）以避免检测框过紧切掉笔画复杂的字
+    log.info(f"OCR 模型加载完成 (GPU={use_gpu})")
     return _ocr_engine
 
 
@@ -175,8 +173,8 @@ def ocr_blocks(image_path: str, blocks: list[dict]) -> dict[int, list[dict]]:
         if label in ("number", "figure", "table"):
             continue
         x1, y1, x2, y2 = block["bbox"]
-        # 边界留小量 padding 避免贴边裁切，但不要大到把相邻行文字带进来
-        pad = 2
+        # 适度扩大裁剪范围，避免边缘字符被裁切
+        pad = 5
         cx1 = max(0, x1 - pad)
         cy1 = max(0, y1 - pad)
         cx2 = min(img.shape[1], x2 + pad)
