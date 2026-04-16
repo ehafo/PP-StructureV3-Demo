@@ -147,7 +147,10 @@ def _get_ocr():
         ppocr5_onnx_det=det, ppocr5_onnx_cls=cls,
         ppocr5_onnx_rec=rec, ppcor5_dict=dic, use_gpu=use_gpu,
     )
-    log.info(f"OCR 模型加载完成 (GPU={use_gpu})")
+    # 调整检测参数，减少重叠框导致的字符重复
+    _ocr_engine.det_db_unclip_ratio = 1.5   # 默认 1.8，降低以避免框扩张后相互重叠
+    _ocr_engine.det_db_box_thresh = 0.6     # 默认 0.5，提高以减少低置信度的重复检测
+    log.info(f"OCR 模型加载完成 (GPU={use_gpu}, unclip=1.5, box_thresh=0.6)")
     return _ocr_engine
 
 
@@ -172,8 +175,8 @@ def ocr_blocks(image_path: str, blocks: list[dict]) -> dict[int, list[dict]]:
         if label in ("number", "figure", "table"):
             continue
         x1, y1, x2, y2 = block["bbox"]
-        # 稍微扩大裁剪范围
-        pad = 5
+        # 边界留小量 padding 避免贴边裁切，但不要大到把相邻行文字带进来
+        pad = 2
         cx1 = max(0, x1 - pad)
         cy1 = max(0, y1 - pad)
         cx2 = min(img.shape[1], x2 + pad)
@@ -195,11 +198,109 @@ def ocr_blocks(image_path: str, blocks: list[dict]) -> dict[int, list[dict]]:
                 int(pos[2][0]) + cx1, int(pos[2][1]) + cy1,
             ]
             lines.append({"text": r["text"], "bbox": bbox})
+
+        # NMS 去重：对重叠检测框只保留面积最大的（包含最完整文字）
+        lines = _nms_ocr_lines(lines)
+        # 文字级去重：合并同一行相邻 bbox 的前后缀重叠
+        lines = _merge_suffix_prefix_lines(lines)
+
         lines.sort(key=lambda l: (l["bbox"][1], l["bbox"][0]))
         result[idx] = lines
         log.info(f"  区域 #{idx}({label}) OCR: {len(lines)} 行")
 
     return result
+
+
+def _nms_ocr_lines(lines: list[dict], iou_threshold: float = 0.5,
+                   contain_threshold: float = 0.7) -> list[dict]:
+    """对 OCR 检测行做 NMS 去重。
+    规则：两个框 IoU>阈值 或 一个框被另一个包含 >阈值 时，保留文字较长的那一个。
+    """
+    if len(lines) <= 1:
+        return lines
+
+    # 按文字长度降序（长文字优先，因为包含更完整信息）
+    sorted_lines = sorted(lines, key=lambda l: -len(l["text"]))
+    kept = []
+    for line in sorted_lines:
+        drop = False
+        for k in kept:
+            if _iou(line["bbox"], k["bbox"]) > iou_threshold:
+                drop = True
+                break
+            # 检查一个框是否大部分被另一个包含
+            if _contain_ratio(line["bbox"], k["bbox"]) > contain_threshold:
+                drop = True
+                break
+        if not drop:
+            kept.append(line)
+    return kept
+
+
+def _contain_ratio(a: list, b: list) -> float:
+    """a 被 b 包含的比例（a∩b / a 的面积）"""
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    if inter == 0:
+        return 0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    if area_a == 0:
+        return 0
+    return inter / area_a
+
+
+def _merge_suffix_prefix_lines(lines: list[dict], max_overlap: int = 6) -> list[dict]:
+    """合并同一行内相邻 bbox 的字符重叠。
+    规则：两个 line 同一行（y 中心差 < 15px）且水平相邻（左 bbox 右边缘与右 bbox 左边缘在 bbox 宽度内重叠），
+    若左 line 的后缀与右 line 的前缀相同，合并并去重重叠部分。
+    """
+    if len(lines) <= 1:
+        return lines
+
+    # 先按 (y, x) 排序
+    sorted_lines = sorted(lines, key=lambda l: (l["bbox"][1], l["bbox"][0]))
+
+    merged = []
+    for line in sorted_lines:
+        if not merged:
+            merged.append(dict(line))
+            continue
+
+        prev = merged[-1]
+        prev_y_center = (prev["bbox"][1] + prev["bbox"][3]) / 2
+        cur_y_center = (line["bbox"][1] + line["bbox"][3]) / 2
+        same_row = abs(prev_y_center - cur_y_center) < 15
+
+        if same_row:
+            # 检查水平重叠（两个 bbox 的 x 有交集）
+            x_overlap = min(prev["bbox"][2], line["bbox"][2]) - max(prev["bbox"][0], line["bbox"][0])
+            if x_overlap > 0:
+                # 寻找前后缀重叠
+                prev_text = prev["text"]
+                cur_text = line["text"]
+                overlap_len = 0
+                max_k = min(len(prev_text), len(cur_text), max_overlap)
+                for k in range(max_k, 0, -1):
+                    if prev_text.endswith(cur_text[:k]):
+                        overlap_len = k
+                        break
+                if overlap_len > 0:
+                    # 合并：保留 prev + cur 去掉前缀
+                    new_text = prev_text + cur_text[overlap_len:]
+                    new_bbox = [
+                        min(prev["bbox"][0], line["bbox"][0]),
+                        min(prev["bbox"][1], line["bbox"][1]),
+                        max(prev["bbox"][2], line["bbox"][2]),
+                        max(prev["bbox"][3], line["bbox"][3]),
+                    ]
+                    prev["text"] = new_text
+                    prev["bbox"] = new_bbox
+                    continue
+        merged.append(dict(line))
+    return merged
 
 
 def ocr_single_block(image_path: str, block: dict) -> list[dict]:
@@ -502,10 +603,42 @@ def _parse_html_table(html: str, cell_bboxes_batch, offset_x: int, offset_y: int
 
 
 # ── 目录行解析 ────────────────────────────────────────────────────
+def _dedupe_repeated_chars(text: str) -> str:
+    """去除目录文本中连续重复的同一字符（OCR 常见错误）。
+    例: "第二二节牙本质" → "第二节牙本质"
+    例: "第一节节口腔黏膜的的基本结构" → "第一节口腔黏膜的基本结构"
+    白名单：保留某些常见叠词（避免误删合法重叠）。
+    """
+    # 常见叠词白名单（在 TOC 中极少出现，但保留以防万一）
+    WHITELIST = {"看看", "好好", "慢慢", "常常", "刚刚", "渐渐", "个个",
+                 "早早", "远远", "静静", "暗暗", "默默", "偷偷", "种种",
+                 "处处", "时时", "天天", "年年", "月月", "日日"}
+    if len(text) < 2:
+        return text
+    out = [text[0]]
+    i = 1
+    while i < len(text):
+        prev = out[-1]
+        cur = text[i]
+        # 仅对中文字符做去重（不处理英文、数字、标点、空格、引导线）
+        if cur == prev and '\u4e00' <= cur <= '\u9fff':
+            # 检查白名单
+            pair = prev + cur
+            if pair not in WHITELIST:
+                # 跳过这个重复字符
+                i += 1
+                continue
+        out.append(cur)
+        i += 1
+    return "".join(out)
+
+
 def _parse_toc_line(line: str) -> dict | None:
     """解析目录行，拆分标题和页码。
     例: '第一章 牙体组织……1' → {"title": "第一章 牙体组织", "page": 1}
     """
+    # 先做字符去重（修复 OCR 重复字符错误）
+    line = _dedupe_repeated_chars(line)
     line = line.strip()
     if not line:
         return None
