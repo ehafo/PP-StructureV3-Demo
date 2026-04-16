@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-04-16
+
+### feat: 乱码检测 + OCR 智能回退
+- 新增 `is_garbage_text()` 函数，检测 CID 字体解码失败、PUA 字符、替换字符等乱码特征
+- `page_has_text()` 增强：文字层提取出乱码时自动判定为扫描件，整页回退 OCR
+- 逐 block 乱码回退：文字型 PDF 中个别区域乱码时，仅对该区域启动 OCR，不影响其他正常区域
+- 表格乱码回退：PyMuPDF 提取的表格单元格超过 30% 乱码时，自动回退 PP-TableMagic V2
+- `build_structured()` 的 `get_text()` 优先使用 OCR 回退结果，确保结构化输出正确
+- 修复 `detect_all()` 调用未定义函数 `ocr_full_page` / `assign_ocr_to_blocks` 的 bug
+- `detect_all()` 同步补齐扫描件表格识别（之前只设 `cells=None`，现在调用 PP-TableMagic V2）
+
 ## 2026-04-11
 
 ### feat: 可视化面板显示所有区域文字内容 + 扫描件表格渲染

@@ -202,6 +202,13 @@ def ocr_blocks(image_path: str, blocks: list[dict]) -> dict[int, list[dict]]:
     return result
 
 
+def ocr_single_block(image_path: str, block: dict) -> list[dict]:
+    """对单个版面区域做 OCR，返回 [{"text":..., "bbox":...}]。用于文字层乱码回退。"""
+    result = ocr_blocks(image_path, [block])
+    return result.get(0, [])
+
+
+
 # ── 表格结构识别（扫描件）── PP-TableMagic V2 ────────────────────
 # 优先用 PP-TableMagic V2 完整产线（表格分类+单元格检测+结构识别+OCR），
 # 没有 PaddlePaddle 则降级为 RapidTable (SLANet_plus ONNX)
@@ -570,6 +577,39 @@ def _is_toc_block(texts: list[str]) -> bool:
 
 
 # ── 判断页面是否有文字层 ─────────────────────────────────────────
+def is_garbage_text(text: str, threshold: float = 0.3) -> bool:
+    """检测提取的文字是否为乱码（CID 字体解码失败、编码错误等）。
+    threshold: 有意义字符占比低于此值判定为乱码。
+    """
+    if not text or len(text) < 3:
+        return False
+
+    n = len(text)
+
+    # U+FFFD 替换字符过多
+    if text.count('\ufffd') / n > 0.1:
+        return True
+
+    # Private Use Area 字符过多（CID 字体解码失败的典型特征）
+    pua = sum(1 for c in text if '\ue000' <= c <= '\uf8ff')
+    if pua / n > 0.15:
+        return True
+
+    # 有意义字符比例过低
+    meaningful = sum(1 for c in text if (
+        c.isalnum()
+        or '\u4e00' <= c <= '\u9fff'   # CJK 基本区
+        or '\u3400' <= c <= '\u4dbf'   # CJK 扩展 A
+        or '\u3000' <= c <= '\u303f'   # CJK 符号
+        or '\uff00' <= c <= '\uffef'   # 全角字符
+        or c in ' \n\r\t.,;:!?()[]{}"\'-/\\·、。，；：！？（）【】《》""''—…'
+    ))
+    if n > 10 and meaningful / n < threshold:
+        return True
+
+    return False
+
+
 def page_has_text(pdf_path: str, page_num: int) -> bool:
     doc = fitz.open(pdf_path)
     page = doc[page_num - 1]
@@ -581,7 +621,14 @@ def page_has_text(pdf_path: str, page_num: int) -> bool:
 
     printable = sum(1 for c in text if c.isprintable() or c in '\n\r\t')
     ratio = printable / len(text) if text else 0
-    return ratio > 0.5
+    if ratio <= 0.5:
+        return False
+
+    if is_garbage_text(text):
+        log.info(f"第 {page_num} 页文字层检测为乱码，将回退 OCR")
+        return False
+
+    return True
 
 
 @app.on_event("startup")
@@ -782,11 +829,11 @@ def build_structured(blocks: list, pdf_path: str | None, page_num: int,
     content = []
 
     def get_text(block_idx: int, bbox: list) -> str:
-        """获取区域文字：有文字层用 PyMuPDF，否则从全页 OCR 结果取"""
+        """获取区域文字：优先用 OCR 回退结果，否则有文字层用 PyMuPDF"""
+        if ocr_by_block and block_idx in ocr_by_block:
+            return "\n".join(it["text"] for it in ocr_by_block[block_idx])
         if has_text_layer and pdf_path:
             return extract_text_from_pdf(pdf_path, page_num, bbox)
-        elif ocr_by_block and block_idx in ocr_by_block:
-            return "\n".join(it["text"] for it in ocr_by_block[block_idx])
         return ""
 
     for idx, block in enumerate(blocks):
@@ -968,11 +1015,20 @@ async def detect(doc_id: str, page_num: int):
     for block in blocks:
         if block["label"] == "table":
             if has_text_layer:
-                block["cells"] = extract_table_cells(
+                cells = extract_table_cells(
                     str(pdf_path), page_num, block["bbox"], w, h
                 )
+                garbage_cells = sum(1 for c in cells if is_garbage_text(c.get("text", "")))
+                if cells and garbage_cells > len(cells) * 0.3:
+                    log.info(f"表格单元格乱码 ({garbage_cells}/{len(cells)})，回退 PP-TableMagic V2")
+                    table_result = recognize_table_structure(str(img_path), block["bbox"])
+                    if table_result and table_result["cells"]:
+                        block["cells"] = table_result["cells"]
+                    else:
+                        block["cells"] = cells
+                else:
+                    block["cells"] = cells
             else:
-                # 扫描件：用 PP-TableMagic V2 做表格结构识别
                 table_result = recognize_table_structure(str(img_path), block["bbox"])
                 if table_result and table_result["cells"]:
                     block["cells"] = table_result["cells"]
@@ -980,12 +1036,26 @@ async def detect(doc_id: str, page_num: int):
                     block["cells"] = None
 
     # 给每个 block 挂上提取到的文字（供前端可视化显示）
+    # 文字层乱码时逐 block 回退 OCR
+    if ocr_by_block is None:
+        ocr_by_block = {}
     for idx, block in enumerate(blocks):
         if block.get("cells") or block.get("table_html"):
-            continue  # 表格有自己的展示方式
+            continue
         if has_text_layer and is_pdf:
-            block["ocr_text"] = extract_text_from_pdf(str(pdf_path), page_num, block["bbox"])
-        elif ocr_by_block and idx in ocr_by_block:
+            text = extract_text_from_pdf(str(pdf_path), page_num, block["bbox"])
+            if is_garbage_text(text):
+                log.info(f"区域 #{idx}({block['label']}) 文字乱码，回退 OCR")
+                ocr_result = ocr_single_block(str(img_path), block)
+                if ocr_result:
+                    ocr_by_block[idx] = ocr_result
+                    block["ocr_text"] = "\n".join(it["text"] for it in ocr_result)
+                    block["text_fallback"] = "ocr"
+                else:
+                    block["ocr_text"] = text
+            else:
+                block["ocr_text"] = text
+        elif idx in ocr_by_block:
             block["ocr_text"] = "\n".join(it["text"] for it in ocr_by_block[idx])
 
     structured = build_structured(
@@ -1033,17 +1103,45 @@ async def detect_all(doc_id: str):
 
         ocr_by_block = None
         if not has_text_layer:
-            ocr_lines = ocr_full_page(str(img_path))
-            ocr_by_block = assign_ocr_to_blocks(ocr_lines, blocks)
+            ocr_by_block = ocr_blocks(str(img_path), blocks)
 
         for block in blocks:
             if block["label"] == "table":
                 if has_text_layer:
-                    block["cells"] = extract_table_cells(
+                    cells = extract_table_cells(
                         str(pdf_path), page_num, block["bbox"], w, h
                     )
+                    garbage_cells = sum(1 for c in cells if is_garbage_text(c.get("text", "")))
+                    if cells and garbage_cells > len(cells) * 0.3:
+                        log.info(f"[detect_all] 表格单元格乱码，回退 PP-TableMagic V2")
+                        table_result = recognize_table_structure(str(img_path), block["bbox"])
+                        if table_result and table_result["cells"]:
+                            block["cells"] = table_result["cells"]
+                        else:
+                            block["cells"] = cells
+                    else:
+                        block["cells"] = cells
                 else:
-                    block["cells"] = None
+                    table_result = recognize_table_structure(str(img_path), block["bbox"])
+                    if table_result and table_result["cells"]:
+                        block["cells"] = table_result["cells"]
+                    else:
+                        block["cells"] = None
+
+        # 逐 block 乱码回退
+        if ocr_by_block is None:
+            ocr_by_block = {}
+        for idx, block in enumerate(blocks):
+            if block.get("cells") or block.get("table_html"):
+                continue
+            if has_text_layer and is_pdf:
+                text = extract_text_from_pdf(str(pdf_path), page_num, block["bbox"])
+                if is_garbage_text(text):
+                    log.info(f"[detect_all] 区域 #{idx}({block['label']}) 文字乱码，回退 OCR")
+                    ocr_result = ocr_single_block(str(img_path), block)
+                    if ocr_result:
+                        ocr_by_block[idx] = ocr_result
+                        block["text_fallback"] = "ocr"
 
         structured = build_structured(
             blocks, str(pdf_path) if is_pdf else None, page_num,
