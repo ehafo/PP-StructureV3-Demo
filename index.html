@@ -490,6 +490,50 @@
         padding: 10px;
         border-radius: 6px;
       }
+      /* 全部检测进度条 */
+      .detect-all-progress {
+        padding: 12px 16px;
+        background: #f8f9fa;
+        border-bottom: 1px solid #e0e0e0;
+      }
+      .detect-all-progress .progress-bar {
+        height: 6px;
+        background: #e0e0e0;
+        border-radius: 3px;
+        overflow: hidden;
+        margin-top: 6px;
+      }
+      .detect-all-progress .progress-bar .fill {
+        height: 100%;
+        background: #1a73e8;
+        border-radius: 3px;
+        transition: width 0.3s;
+      }
+      .detect-all-progress .progress-text {
+        font-size: 12px;
+        color: #666;
+      }
+      .merged-notice {
+        margin-top: 6px;
+        padding: 4px 8px;
+        background: #e8f5e9;
+        border-left: 3px solid #4caf50;
+        font-size: 11px;
+        color: #2e7d32;
+        border-radius: 0 4px 4px 0;
+      }
+      .btn-detect-all {
+        background: #0d47a1;
+        color: #fff;
+        border: none;
+        padding: 6px 12px;
+        border-radius: 4px;
+        font-size: 13px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .btn-detect-all:hover { background: #1565c0; }
+      .btn-detect-all:disabled { opacity: 0.5; cursor: not-allowed; }
     </style>
   </head>
   <body>
@@ -541,16 +585,22 @@
                 >可视化</span
               >
               <span onclick="switchResultView('json')">JSON</span>
+              <span onclick="switchResultView('json-all')" id="jsonAllTab" style="display:none">全文档</span>
             </div>
             <button class="btn btn-primary" id="detectBtn" disabled>
               检测当前页
             </button>
+            <button class="btn-detect-all" id="detectAllBtn" disabled>
+              全部检测
+            </button>
           </div>
         </div>
+        <div id="detectAllProgress" style="display:none"></div>
         <div class="result-list" id="resultList">
           <div class="loading">上传文件后开始检测</div>
         </div>
         <div class="json-view" id="jsonView"></div>
+        <div class="json-view" id="jsonAllView" style="display:none"></div>
       </div>
     </div>
 
@@ -583,10 +633,11 @@
         detectedPages: {},
         isPdf: false,
         resultView: "visual",
+        allPagesData: null,
       };
 
       function saveCache() {
-        const { docId, pages, activePage, detectedPages, isPdf, resultView } =
+        const { docId, pages, activePage, detectedPages, isPdf, resultView, allPagesData } =
           state;
         localStorage.setItem(
           CACHE_KEY,
@@ -597,6 +648,7 @@
             detectedPages,
             isPdf,
             resultView,
+            allPagesData,
           }),
         );
       }
@@ -627,7 +679,10 @@
           mode === "visual" ? "block" : "none";
         document.getElementById("jsonView").style.display =
           mode === "json" ? "block" : "none";
+        document.getElementById("jsonAllView").style.display =
+          mode === "json-all" ? "block" : "none";
         if (mode === "json") renderJson();
+        if (mode === "json-all") renderJsonAll();
         saveCache();
       }
 
@@ -640,6 +695,19 @@
         }
         const structured = data.structured || data;
         view.innerHTML = `<pre>${escHtml(JSON.stringify(structured, null, 2))}</pre>`;
+      }
+
+      function renderJsonAll() {
+        const view = document.getElementById("jsonAllView");
+        if (!state.allPagesData) {
+          view.innerHTML = '<div class="loading">请先执行「全部检测」</div>';
+          return;
+        }
+        const allStructured = state.allPagesData.pages.map(p => p.structured);
+        const merges = state.allPagesData.table_merges;
+        const output = { pages: allStructured };
+        if (merges && merges.length > 0) output.table_merges = merges;
+        view.innerHTML = `<pre>${escHtml(JSON.stringify(output, null, 2))}</pre>`;
       }
 
       // ── 模型状态轮询 ────────────────────────────────────────────────
@@ -663,6 +731,7 @@
               if (!modelReady) {
                 modelReady = true;
                 document.getElementById("detectBtn").disabled = !state.activePage;
+                document.getElementById("detectAllBtn").disabled = !state.docId;
               }
               // 表格引擎也就绪后停止轮询
               if (data.table_engine && data.table_engine !== "none") return;
@@ -715,10 +784,14 @@
         state.pages = data.pages;
         state.isPdf = data.is_pdf;
         state.detectedPages = {};
+        state.allPagesData = null;
+        document.getElementById("jsonAllTab").style.display = "none";
+        document.getElementById("detectAllProgress").style.display = "none";
 
         renderSidebar();
         selectPage(1);
         saveCache();
+        if (modelReady) document.getElementById("detectAllBtn").disabled = false;
       }
 
       // ── 侧边栏 ────────────────────────────────────────────────────────
@@ -803,6 +876,99 @@
         }
         btn.textContent = "检测当前页";
         btn.disabled = false;
+      }
+
+      // ── 全部检测 ────────────────────────────────────────────────────
+      document
+        .getElementById("detectAllBtn")
+        .addEventListener("click", detectAll);
+
+      async function detectAll() {
+        const btn = document.getElementById("detectAllBtn");
+        const detectBtn = document.getElementById("detectBtn");
+        btn.disabled = true;
+        detectBtn.disabled = true;
+        btn.textContent = "检测中...";
+
+        const progressEl = document.getElementById("detectAllProgress");
+        const totalPages = state.pages.length;
+        progressEl.style.display = "block";
+        progressEl.innerHTML = `<div class="detect-all-progress">
+          <div class="progress-text">正在检测所有页面... 0/${totalPages}</div>
+          <div class="progress-bar"><div class="fill" style="width:0%"></div></div>
+        </div>`;
+
+        try {
+          // 逐页检测以显示进度（detect-all 是同步的，无法实时进度）
+          // 先用逐页检测填充 state，最后调 detect-all 做跨页合并
+          for (let i = 1; i <= totalPages; i++) {
+            progressEl.querySelector(".progress-text").textContent =
+              `正在检测第 ${i}/${totalPages} 页...`;
+            progressEl.querySelector(".fill").style.width =
+              `${((i - 0.5) / totalPages) * 100}%`;
+
+            if (!state.detectedPages[i]) {
+              const res = await fetch(`/api/detect/${state.docId}/${i}`, { method: "POST" });
+              const data = await res.json();
+              state.detectedPages[i] = data;
+            }
+            progressEl.querySelector(".fill").style.width =
+              `${(i / totalPages) * 100}%`;
+          }
+
+          // 调用 detect-all 获取跨页合并结果
+          progressEl.querySelector(".progress-text").textContent =
+            "正在做跨页表格合并分析...";
+          const allRes = await fetch(`/api/detect-all/${state.docId}`, { method: "POST" });
+          const allData = await allRes.json();
+          state.allPagesData = allData;
+
+          // 用 detect-all 的结果更新每页数据（包含合并信息）
+          for (const pageData of allData.pages) {
+            state.detectedPages[pageData.page] = pageData;
+          }
+
+          // 显示合并信息
+          const merges = allData.table_merges;
+          if (merges && merges.length > 0) {
+            const mergeText = merges.map(m =>
+              `第${m.from_page}页续表 → 第${m.into_page}页（+${m.rows_added}行${m.header_skipped ? "，去重表头" : ""}）`
+            ).join("\n");
+            progressEl.innerHTML = `<div class="detect-all-progress">
+              <div class="progress-text" style="color:#2e7d32">
+                ✓ 全部 ${totalPages} 页检测完成，${merges.length} 处跨页表格已合并
+              </div>
+              <div style="font-size:11px;color:#666;margin-top:4px">${merges.map(m =>
+                `第${m.from_page}页续表 → 第${m.into_page}页（+${m.rows_added}行${m.header_skipped ? "，去重表头" : ""}）`
+              ).join("<br>")}</div>
+            </div>`;
+          } else {
+            progressEl.innerHTML = `<div class="detect-all-progress">
+              <div class="progress-text" style="color:#2e7d32">
+                ✓ 全部 ${totalPages} 页检测完成，未发现跨页表格
+              </div>
+            </div>`;
+          }
+
+          // 显示"全文档"JSON tab
+          document.getElementById("jsonAllTab").style.display = "";
+
+          // 刷新当前页显示
+          renderSidebar();
+          if (state.activePage) {
+            drawBoxes(state.detectedPages[state.activePage]);
+            renderResults();
+            renderJson();
+          }
+          saveCache();
+        } catch (e) {
+          progressEl.innerHTML = `<div class="detect-all-progress">
+            <div class="progress-text" style="color:#ea4335">检测失败: ${e.message}</div>
+          </div>`;
+        }
+        btn.textContent = "全部检测";
+        btn.disabled = false;
+        detectBtn.disabled = false;
       }
 
       // ── 高亮联动 ─────────────────────────────────────────────────────
@@ -1035,8 +1201,13 @@ function highlightTocItem(blockIdx, tocIdx) {
             let extra = "";
 
             if (b.label === "table") {
-              if (b.cells && b.cells.length > 0) {
+              if (b._merged_into) {
+                extra = `<div class="merged-notice">此表格已合并至第 ${b._merged_into[0] !== undefined ? "前" : ""}页的表格中</div>`;
+              } else if (b.cells && b.cells.length > 0) {
                 extra = renderCellsTable(b.cells, idx);
+                if (b.merged_from_pages && b.merged_from_pages.length > 1) {
+                  extra += `<div class="merged-notice">跨页合并表格（来自第 ${b.merged_from_pages.join("、")} 页）</div>`;
+                }
               } else if (b.cells === null) {
                 extra =
                   '<div class="image-hint">扫描件表格：已通过 OCR 识别文字，但无法解析单元格行列结构</div>';
@@ -1380,6 +1551,9 @@ function highlightTocItem(blockIdx, tocIdx) {
       if (loadCache()) {
         renderSidebar();
         selectPage(state.activePage || 1);
+        if (state.allPagesData) {
+          document.getElementById("jsonAllTab").style.display = "";
+        }
       }
     </script>
   </body>
