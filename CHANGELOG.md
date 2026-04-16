@@ -2,6 +2,16 @@
 
 ## 2026-04-16
 
+### feat: 跨页表格合并
+- 新增 `merge_cross_page_tables()` 后处理函数，在 `detect_all()` 所有页面处理完后自动检测并合并续表
+- 滑动指针算法：支持三页及以上的连续表格合并
+- 智能表头去重：续表第一行与前页表头相似度 >80% 时自动跳过
+- 列结构匹配：通过列数 + 列宽比例判断是否为同一表格（容差 15%）
+- 位置约束：仅合并"页面下半部表格 → 下页上半部表格"的情况，避免误合并
+- 合并后自动重建 structured JSON，续表所在页的表格内容被移除
+- API 返回 `table_merges` 字段记录合并详情
+- 辅助函数：`_table_to_grid`、`_row_similarity`、`_col_widths_ratio`、`_col_structure_similar`
+
 ### feat: 乱码检测 + OCR 智能回退
 - 新增 `is_garbage_text()` 函数，检测 CID 字体解码失败、PUA 字符、替换字符等乱码特征
 - `page_has_text()` 增强：文字层提取出乱码时自动判定为扫描件，整页回退 OCR

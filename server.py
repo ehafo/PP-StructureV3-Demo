@@ -925,6 +925,219 @@ def build_structured(blocks: list, pdf_path: str | None, page_num: int,
     return {"page": page_num, "content": content}
 
 
+
+def _table_to_grid(cells: list[dict]) -> tuple[list[list[str]], int, int]:
+    """将 cells 列表转为二维网格，返回 (grid, max_row, max_col)"""
+    if not cells:
+        return [], -1, -1
+    max_row = max(c["row"] for c in cells)
+    max_col = max(c["col"] for c in cells)
+    grid = [[""] * (max_col + 1) for _ in range(max_row + 1)]
+    for c in cells:
+        grid[c["row"]][c["col"]] = c.get("text") or ""
+    return grid, max_row, max_col
+
+
+def _row_similarity(row_a: list[str], row_b: list[str]) -> float:
+    """计算两行文字的相似度（0~1），用于判断续表表头是否重复"""
+    if len(row_a) != len(row_b):
+        return 0.0
+    if not row_a:
+        return 0.0
+    matches = sum(1 for a, b in zip(row_a, row_b)
+                  if _clean_text(a) == _clean_text(b))
+    return matches / len(row_a)
+
+
+def _col_widths_ratio(cells: list[dict]) -> list[float]:
+    """计算每列宽度占比，用于判断两个表格列结构是否一致"""
+    if not cells:
+        return []
+    max_col = max(c["col"] for c in cells)
+    col_bounds = {}
+    for c in cells:
+        col = c["col"]
+        x1, _, x2, _ = c["bbox"]
+        if col not in col_bounds:
+            col_bounds[col] = [x1, x2]
+        else:
+            col_bounds[col][0] = min(col_bounds[col][0], x1)
+            col_bounds[col][1] = max(col_bounds[col][1], x2)
+
+    widths = []
+    for col in range(max_col + 1):
+        if col in col_bounds:
+            widths.append(col_bounds[col][1] - col_bounds[col][0])
+        else:
+            widths.append(0)
+    total = sum(widths) or 1
+    return [w / total for w in widths]
+
+
+def _col_structure_similar(cells_a: list[dict], cells_b: list[dict],
+                           tolerance: float = 0.15) -> bool:
+    """判断两个表格的列结构是否相似（列数相同且列宽比例接近）"""
+    max_col_a = max(c["col"] for c in cells_a) if cells_a else -1
+    max_col_b = max(c["col"] for c in cells_b) if cells_b else -1
+    if max_col_a != max_col_b or max_col_a < 0:
+        return False
+
+    ratios_a = _col_widths_ratio(cells_a)
+    ratios_b = _col_widths_ratio(cells_b)
+    for ra, rb in zip(ratios_a, ratios_b):
+        if abs(ra - rb) > tolerance:
+            return False
+    return True
+
+
+def merge_cross_page_tables(pages_result: list[dict]) -> list[dict]:
+    """跨页表格合并：检测连续页的续表并合并到第一个表格所在页。
+    使用滑动指针追踪待续表格，支持三页及以上的连续合并。
+    """
+    merge_info = []
+    # 滑动指针：当前"待续"表格
+    open_page_idx = None   # 待续表格所在页的 index
+    open_block = None      # 待续表格的 block 引用
+
+    for i in range(len(pages_result)):
+        page = pages_result[i]
+        blocks = page.get("blocks", [])
+        page_h = page.get("height", 0)
+
+        # 找本页第一个有 cells 的 table（续表候选）
+        first_table = None
+        for b in blocks:
+            if b["label"] == "table" and b.get("cells"):
+                first_table = b
+                break
+
+        # 尝试与 open_block 合并
+        if open_block is not None and first_table is not None:
+            cells_a = open_block["cells"]
+            cells_b = first_table["cells"]
+
+            # 位置：续表应在页面上半部
+            table_b_top = min(c["bbox"][1] for c in cells_b)
+            position_ok = page_h <= 0 or table_b_top < page_h * 0.5
+
+            if position_ok and _col_structure_similar(cells_a, cells_b):
+                grid_a, max_row_a, _ = _table_to_grid(cells_a)
+                grid_b, max_row_b, _ = _table_to_grid(cells_b)
+
+                # 检测并跳过重复表头
+                start_row_b = 0
+                if max_row_b >= 0 and _row_similarity(grid_a[0], grid_b[0]) > 0.8:
+                    start_row_b = 1
+                    log.info(f"跨页表格合并: 第{page['page']}页续表表头与前页相同，跳过")
+
+                if start_row_b <= max_row_b:
+                    # 执行合并
+                    new_row_offset = max_row_a + 1
+                    for c in cells_b:
+                        if c["row"] < start_row_b:
+                            continue
+                        open_block["cells"].append({
+                            "bbox": c["bbox"],
+                            "row": c["row"] - start_row_b + new_row_offset,
+                            "col": c["col"],
+                            "text": c.get("text", ""),
+                        })
+
+                    open_page = pages_result[open_page_idx]
+                    open_block["merged_from_pages"] = open_block.get(
+                        "merged_from_pages", [open_page["page"]])
+                    open_block["merged_from_pages"].append(page["page"])
+                    first_table["_merged_into"] = (open_page_idx,)
+
+                    rows_added = max_row_b + 1 - start_row_b
+                    merge_info.append({
+                        "from_page": page["page"],
+                        "into_page": open_page["page"],
+                        "rows_added": rows_added,
+                        "header_skipped": start_row_b > 0,
+                    })
+                    log.info(
+                        f"跨页表格合并: 第{page['page']}页续表 → 第{open_page['page']}页"
+                        f" (+{rows_added}行"
+                        f"{'，跳过重复表头' if start_row_b > 0 else ''})")
+
+                    # 合并后 open_block 继续保持（支持三页+连续合并）
+                    # 但需检查本页是否还有其他表格在底部
+                    last_table_this_page = None
+                    for b in reversed(blocks):
+                        if b["label"] == "table" and b.get("cells") and not b.get("_merged_into"):
+                            last_table_this_page = b
+                            break
+                    # 如果本页底部还有另一个表格（不是被合并的那个），更新 open
+                    if last_table_this_page and last_table_this_page is not first_table:
+                        tb = max(c["bbox"][3] for c in last_table_this_page["cells"])
+                        if page_h <= 0 or tb >= page_h * 0.5:
+                            open_page_idx = i
+                            open_block = last_table_this_page
+                    # 否则 open_block 保持不变（继续用合并后的表格）
+                    continue  # 跳过下面的 open_block 更新
+
+        # 更新 open_block：找本页最后一个在底部的表格
+        open_page_idx = None
+        open_block = None
+        for b in reversed(blocks):
+            if b["label"] == "table" and b.get("cells") and not b.get("_merged_into"):
+                tb = max(c["bbox"][3] for c in b["cells"])
+                if page_h <= 0 or tb >= page_h * 0.5:
+                    open_page_idx = i
+                    open_block = b
+                break
+
+    # 重建受影响页的 structured content
+    if merge_info:
+        for page_data in pages_result:
+            blocks = page_data.get("blocks", [])
+
+            # 重建合并源表格的 structured
+            for block in blocks:
+                if block["label"] == "table" and block.get("merged_from_pages"):
+                    cells = block["cells"]
+                    max_row = max(c["row"] for c in cells)
+                    max_col = max(c["col"] for c in cells)
+                    grid = [[""] * (max_col + 1) for _ in range(max_row + 1)]
+                    for c in cells:
+                        grid[c["row"]][c["col"]] = c.get("text") or ""
+
+                    headers = [_clean_text(grid[0][c] or f"列{c+1}") for c in range(max_col + 1)]
+                    rows = []
+                    prev = [""] * (max_col + 1)
+                    for r in range(1, max_row + 1):
+                        row_data = {}
+                        for ci in range(max_col + 1):
+                            val = grid[r][ci]
+                            if val is None or val == "":
+                                val = prev[ci]
+                            else:
+                                prev[ci] = val
+                            row_data[headers[ci]] = _split_value(val)
+                        rows.append(row_data)
+
+                    for idx, item in enumerate(page_data["structured"]["content"]):
+                        if item["type"] == "table":
+                            page_data["structured"]["content"][idx] = {
+                                "type": "table", "headers": headers, "rows": rows,
+                                "merged_from_pages": block["merged_from_pages"],
+                            }
+                            break
+
+            # 移除被合并走的表格
+            has_merged_away = any(b.get("_merged_into") for b in blocks if b["label"] == "table")
+            if has_merged_away:
+                page_data["structured"]["content"] = [
+                    item for item in page_data["structured"]["content"]
+                    if not (item["type"] == "table" and
+                            not item.get("merged_from_pages") and
+                            item.get("headers"))
+                ]
+
+    return merge_info
+
+
 # ── API 路由 ───────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -1154,7 +1367,13 @@ async def detect_all(doc_id: str):
             "structured": structured,
         })
 
-    return {"doc_id": doc_id, "pages": pages_result, "is_pdf": is_pdf}
+    # 跨页表格合并
+    merge_info = merge_cross_page_tables(pages_result)
+    if merge_info:
+        log.info(f"跨页表格合并完成: {len(merge_info)} 处")
+
+    return {"doc_id": doc_id, "pages": pages_result, "is_pdf": is_pdf,
+            "table_merges": merge_info if merge_info else None}
 
 
 @app.delete("/api/documents/{doc_id}")
